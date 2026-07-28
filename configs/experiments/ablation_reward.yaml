@@ -1,0 +1,29 @@
+experiment:
+  name: ablation_reward
+  seed: 42
+
+dataset:
+  name: movielens_100k
+
+workflow:
+  name: grpo4rec
+  task: candidate_choice
+
+model:
+  name: qwen2.5-0.5b-instruct
+
+training:
+  stages:
+    - grpo
+    - evaluate
+    - analyze
+    - report
+
+grpo:
+  num_generations: 4
+  beta: 0.04
+  reward_weights:
+    exact_match: 1.0
+    format_validity: 0.2
+    rank_aware: 0.5
+    popularity_penalty: 0.5

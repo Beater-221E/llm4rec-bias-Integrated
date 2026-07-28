@@ -1,0 +1,13 @@
+workflow:
+  name: mllm4rec
+  task: candidate_choice
+  modality: text
+  stages:
+    - prepare_data
+    - build_candidate_sets
+    - build_text_or_multimodal_prompts
+    - sft
+    - optional_rl
+    - candidate_ranking_evaluation
+    - counterfactual_probes
+    - report

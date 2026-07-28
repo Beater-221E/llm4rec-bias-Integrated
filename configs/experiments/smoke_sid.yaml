@@ -1,0 +1,79 @@
+# MiniOneRec SID smoke: residual k-means → SFT → GRPO → constrained eval
+experiment:
+  name: smoke_sid
+  seed: 42
+
+dataset:
+  name: movielens_100k
+  rating_threshold: 4.0
+  split: leave_one_out
+  history_max_length: 8
+  train_per_user: 2
+  train_limit: 64
+  eval_limit: 16
+
+workflow:
+  name: minionerec
+  task: semantic_id_generation
+  semantic_id:
+    method: residual_kmeans
+    levels: 3
+    codebook_size: 64
+    collision_handling: extra_level
+
+model:
+  name: qwen2.5-0.5b-instruct
+  checkpoint: Qwen/Qwen2.5-0.5B-Instruct
+  dtype: float16
+  use_flash_attention: false
+  gradient_checkpointing: true
+
+peft:
+  enabled: true
+  method: lora
+  rank: 8
+  alpha: 16
+  dropout: 0.05
+
+training:
+  stages:
+    - sft
+    - grpo
+    - evaluate
+    - analyze
+  batch_size: 2
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0001
+  epochs: 1
+  max_steps: 4
+  eval_steps: 4
+  save_steps: 4
+  logging_steps: 1
+  max_seq_length: 512
+
+grpo:
+  num_generations: 2
+  prompts_per_step: 1
+  beta: 0.04
+  max_completion_length: 8
+  temperature: 0.9
+  max_steps: 4
+  learning_rate: 0.000005
+  prefix_credit: 0.1
+  invalid_penalty: -0.5
+  advantage_normalization: group
+
+evaluation:
+  top_k:
+    - 1
+    - 5
+    - 10
+  max_examples: 8
+  free_gen_n: 4
+  use_upstream_eval: true
+
+tracking:
+  console: true
+  jsonl: true
+  tensorboard: false
+  wandb: false

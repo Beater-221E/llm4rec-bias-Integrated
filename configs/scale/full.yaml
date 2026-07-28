@@ -1,0 +1,22 @@
+# Full run: clear smoke limits and use quieter logging cadence.
+# Compose with: scale=full
+scale:
+  name: full
+
+dataset:
+  train_limit: null
+  eval_limit: null
+
+training:
+  max_steps: null
+  epochs: 1
+  logging_steps: 50
+  eval_steps: 500
+  save_steps: 500
+  disable_tqdm: false
+
+grpo:
+  max_steps: 100
+
+evaluation:
+  max_examples: null

@@ -1,0 +1,4 @@
+# Smoke / limited run. Limits live in experiment YAMLs (smoke_*).
+# Compose with: scale=smoke (default).
+scale:
+  name: smoke

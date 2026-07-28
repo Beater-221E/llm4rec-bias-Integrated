@@ -1,0 +1,5 @@
+model:
+  name: qwen2.5-1.5b-instruct
+  checkpoint: Qwen/Qwen2.5-1.5B-Instruct
+  dtype: bfloat16
+  gradient_checkpointing: true

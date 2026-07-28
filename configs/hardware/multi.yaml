@@ -1,0 +1,16 @@
+# Multi-GPU profile (Accelerate auto-launch). Compose with: hardware=multi
+# Edit cuda_visible_devices for your machine.
+hardware:
+  name: multi
+  cuda_visible_devices: "0,1,2,3"
+  # MLLM Retriever/Ranker CLI remains single-GPU.
+  mllm_cuda_visible_devices: "0"
+  env:
+    NCCL_P2P_DISABLE: "1"
+    NCCL_IB_DISABLE: "1"
+    NCCL_NVML_ENABLE: "0"
+    TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+
+training:
+  distributed: auto
+  auto_launch_multi_gpu: true

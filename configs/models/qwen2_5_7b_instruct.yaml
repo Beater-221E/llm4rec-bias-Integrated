@@ -1,0 +1,12 @@
+model:
+  name: qwen2.5-7b-instruct
+  checkpoint: Qwen/Qwen2.5-7B-Instruct
+  dtype: bfloat16
+  gradient_checkpointing: true
+
+peft:
+  enabled: true
+  method: lora
+  rank: 16
+  alpha: 32
+  dropout: 0.05

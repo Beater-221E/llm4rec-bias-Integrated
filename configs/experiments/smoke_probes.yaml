@@ -1,0 +1,61 @@
+# Tiny bias-probe smoke against an existing run_dir
+experiment:
+  name: smoke_probes
+  seed: 42
+
+dataset:
+  name: movielens_100k
+  rating_threshold: 4.0
+  split: leave_one_out
+  history_max_length: 8
+  candidate_size: 10
+  negative_sampling: uniform
+  target_position: random
+  framing: neutral
+
+workflow:
+  name: grpo4rec
+  task: candidate_choice
+
+model:
+  name: qwen2.5-0.5b-instruct
+  checkpoint: Qwen/Qwen2.5-0.5B-Instruct
+  dtype: float16
+  use_flash_attention: false
+  gradient_checkpointing: true
+
+bias:
+  name: default
+  max_examples: 16
+  probes:
+    - popularity
+    - position
+    - framing
+    - recency
+  position:
+    n: 8
+    place_target_at_all_slots: true
+    compute_spread: true
+    compute_kendall: true
+  framing:
+    variants:
+      - neutral
+      - evaluative
+  recency:
+    interventions:
+      - reverse_history
+      - shuffle_history
+
+evaluation:
+  top_k:
+    - 1
+    - 5
+    - 10
+  split: test
+  use_upstream_eval: true
+
+tracking:
+  console: true
+  jsonl: true
+  tensorboard: false
+  wandb: false

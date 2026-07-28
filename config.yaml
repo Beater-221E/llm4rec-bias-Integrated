@@ -1,0 +1,138 @@
+# 全局默认配置（项目根目录）。用 experiment=… / hardware=… / scale=… 组合覆盖。
+# 硬件与规模：configs/hardware/{single,multi}.yaml · configs/scale/{smoke,full}.yaml
+
+# —— 实验元信息 ——
+experiment:
+  name: default          # 实验名（写入 runs/ 路径）
+  seed: 42               # 随机种子（数据划分 / 训练）
+
+seed: 42                 # 顶层种子；与 experiment.seed 二选一，优先 experiment
+
+# —— 路径（相对项目根，除非写绝对路径）——
+paths:
+  data_root: data              # 数据总根
+  raw_dir: data/raw            # 原始下载
+  processed_dir: data/processed  # 预处理产物
+  cache_dir: data/cache        # 缓存
+  runs_dir: runs               # Letter / SID 训练输出
+  reports_dir: reports         # 汇总报告
+
+# —— 模型别名：短名 → Hugging Face Instruct 权重 ——
+# 在此维护别名，勿在 trainer 里写死特殊逻辑；无 -instruct 的短名为兼容别名。
+models:
+  qwen2.5-0.5b-instruct:
+    checkpoint: Qwen/Qwen2.5-0.5B-Instruct
+  qwen2.5-1.5b-instruct:
+    checkpoint: Qwen/Qwen2.5-1.5B-Instruct
+  qwen2.5-3b-instruct:
+    checkpoint: Qwen/Qwen2.5-3B-Instruct
+  qwen2.5-7b-instruct:
+    checkpoint: Qwen/Qwen2.5-7B-Instruct
+  qwen2.5-0.5b:
+    checkpoint: Qwen/Qwen2.5-0.5B-Instruct
+  qwen2.5-1b:
+    checkpoint: Qwen/Qwen2.5-1.5B-Instruct  # 1b 别名映射到 1.5B
+  qwen2.5-1.5b:
+    checkpoint: Qwen/Qwen2.5-1.5B-Instruct
+  qwen2.5-3b:
+    checkpoint: Qwen/Qwen2.5-3B-Instruct
+  qwen2.5-7b:
+    checkpoint: Qwen/Qwen2.5-7B-Instruct
+
+# —— 数据集（letter / SID 共用字段）——
+dataset:
+  name: movielens_100k       # 注册数据集名（见 configs/datasets/）
+  rating_threshold: 4.0      # ≥ 此分视为正反馈
+  split: leave_one_out       # 划分策略：leave_one_out 等
+  history_max_length: 20     # 用户历史截断长度
+  candidate_size: 8         # 候选集大小（含正样本）
+  negative_sampling: uniform # 负采样：uniform 等
+  target_position: random    # 正样本在候选中的位置：random / fixed …
+  framing: neutral           # 提示词表述：neutral / positive …
+  min_user_interactions: 5   # 过滤交互过少的用户
+  train_limit: null          # 训练样本上限；null=不截断（冒烟用 experiment 覆盖）
+  eval_limit: null           # 评测样本上限；null=不截断
+
+# —— 工作流 ——
+workflow:
+  name: grpo4rec             # grpo4rec(letter) | minionerec(SID) | mllm4rec
+  task: candidate_choice     # 任务类型：candidate_choice / semantic_id_generation …
+
+# —— 当前实验所用模型（name 可走上方 alias）——
+model:
+  name: qwen2.5-0.5b-instruct
+  checkpoint: null           # null 时由 models 别名解析
+  revision: null             # HF revision / commit；null=默认
+  dtype: float16             # 权重精度（V100 用 float16）
+  use_flash_attention: false # FlashAttention；需硬件/库支持
+  gradient_checkpointing: true  # 以算换显存
+  trust_remote_code: false   # 是否允许远端自定义代码
+
+# —— PEFT / LoRA ——
+peft:
+  enabled: true              # false=全参（7B 默认禁止，需显式确认）
+  method: lora
+  rank: 16                   # LoRA 秩
+  alpha: 32                  # LoRA 缩放
+  dropout: 0.05
+  target_modules:            # 注入 LoRA 的注意力投影层
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+
+# —— 训练调度 ——
+# distributed / auto_launch_multi_gpu 由 configs/hardware/{single,multi}.yaml 提供
+training:
+  stages:                    # 流水线阶段：sft | grpo | evaluate | analyze | report
+    - sft
+    - evaluate
+  batch_size: 2              # 每卡 micro-batch
+  gradient_accumulation_steps: 8  # 梯度累积；有效 batch ≈ bs×accum×n_gpus
+  learning_rate: 0.0001
+  epochs: 1
+  eval_steps: 50             # 每隔多少 step 做验证
+  save_steps: 50             # 每隔多少 step 存 checkpoint
+  logging_steps: 50          # 每隔多少 step 写一次统计表到 run console.log
+  max_seq_length: 1024       # 最大序列长度（token）
+  disable_tqdm: false        # false=终端单行进度条
+
+# —— GRPO（组相对策略优化）——
+grpo:
+  num_generations: 4         # 每 prompt 采样条数（≥2）
+  beta: 0.04                 # KL 惩罚系数
+  max_prompt_length: 1024
+  max_completion_length: 16  # 生成最大长度（letter 答案很短）
+  temperature: 1.0           # 采样温度
+  top_p: 1.0                 # nucleus sampling
+  advantage_normalization: group  # 优势归一化：group 内归一
+  reward_weights:            # 各奖励分量权重（不可全为 0）
+    exact_match: 1.0         # 与标签完全匹配
+    format_validity: 0.2     # 输出格式合法
+    rank_aware: 0.0          # 排序感知奖励
+    semantic_prefix: 0.0     # SID 前缀匹配奖励
+    popularity_penalty: 0.0  # 热门偏置惩罚
+
+# —— 评测 ——
+evaluation:
+  top_k:                     # 报告 HR@k / NDCG@k 等
+    - 1
+    - 5
+    - 10
+  use_upstream_eval: true    # 使用与上游兼容的评测实现
+  max_examples: null         # 评测样本上限；null=全量
+
+# —— 偏见 / 捷径探针（analyze 阶段）——
+bias:
+  probes:
+    - popularity             # 流行度偏置
+    - position               # 候选位置偏置
+    - framing                # 提示表述偏置
+    - recency                # 时效偏置
+
+# —— 日志与追踪 ——
+tracking:
+  console: true              # 终端输出
+  jsonl: true                # 写 JSONL 指标日志
+  tensorboard: false
+  wandb: false

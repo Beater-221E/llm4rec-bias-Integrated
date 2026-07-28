@@ -1,0 +1,11 @@
+workflow:
+  name: grpo4rec
+  task: candidate_choice
+  stages:
+    - prepare_data
+    - optional_sft
+    - build_reference_policy
+    - grpo
+    - checkpoint_evaluation
+    - reward_hacking_analysis
+    - report

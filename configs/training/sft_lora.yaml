@@ -1,0 +1,12 @@
+training:
+  name: sft_lora
+  stages:
+    - sft
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 0.0002
+  epochs: 2
+  eval_steps: 100
+  save_steps: 100
+  logging_steps: 10
+  max_seq_length: 1024

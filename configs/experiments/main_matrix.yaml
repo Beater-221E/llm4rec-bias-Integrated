@@ -1,0 +1,31 @@
+experiment:
+  name: main_matrix
+  seed: 42
+
+# Full matrix is executed in Phase 10; this file documents the intended grid.
+matrix:
+  datasets:
+    - movielens_100k
+    - movielens_1m
+  workflows:
+    - minionerec
+    - mllm4rec
+    - grpo4rec
+  models:
+    - qwen2.5-0.5b-instruct
+    - qwen2.5-1.5b-instruct
+    - qwen2.5-3b-instruct
+    - qwen2.5-7b-instruct
+  seeds:
+    - 42
+    - 43
+    - 44
+
+training:
+  stages:
+    - prepare
+    - sft
+    - grpo
+    - evaluate
+    - analyze
+    - report

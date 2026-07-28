@@ -1,0 +1,24 @@
+# Official-compatible LRU retriever for MLLM4Rec (ml-100k = ml-latest-small).
+# Defaults follow MLLM4Rec set_template for ml-100k.
+
+dataset:
+  dataset_pkl: data/preprocessed/ml-100k_min_rating0-min_uc5-min_sc5/dataset.pkl
+
+retriever:
+  export_root: experiments/lru/ml-100k
+  device: cuda
+  seed: 42
+  bert_max_len: 200
+  bert_hidden_units: 64
+  bert_num_blocks: 2
+  train_batch_size: 16
+  val_batch_size: 16
+  test_batch_size: 16
+  num_epochs: 500
+  val_strategy: iteration
+  val_iterations: 500
+  early_stopping_patience: 20
+  lr: 0.001
+  weight_decay: 0.01
+  bert_dropout: 0.2
+  bert_attn_dropout: 0.2

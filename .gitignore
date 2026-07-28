@@ -1,0 +1,67 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual envs
+.venv/
+venv/
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Data & runs (keep directory placeholders via .gitkeep)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/preprocessed/*
+!data/preprocessed/.gitkeep
+data/cache/*
+!data/cache/.gitkeep
+logs/mllm4rec/*
+!logs/mllm4rec/.gitkeep
+runs/*
+!runs/.gitkeep
+experiments/*
+!experiments/.gitkeep
+reports/*
+!reports/.gitkeep
+
+
+
+# OS
+.DS_Store
+
+# Logs / notebooks checkpoints
+*.log
+.ipynb_checkpoints/
+
+# Model / pickle artifacts
+*.pkl
+*.pt
+*.bin
+*.ckpt
+*.safetensors
+
+# Broader logs (retain mllm4rec .gitkeep rules above)
+logs/*
+!logs/**/.gitkeep
+
+# Checkpoints
+checkpoints/
+**/checkpoints/
+
