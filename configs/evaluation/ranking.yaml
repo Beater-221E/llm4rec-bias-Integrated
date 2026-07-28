@@ -1,0 +1,8 @@
+evaluation:
+  name: ranking
+  top_k: [1, 5, 10]
+  metrics:
+    - hr
+    - recall
+    - ndcg
+    - mrr

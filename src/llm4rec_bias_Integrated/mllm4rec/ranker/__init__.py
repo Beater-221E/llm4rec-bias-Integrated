@@ -1,3 +1,2 @@
-from llm4rec_bias_Integrated.mllm4rec.ranker.train import train_ranker
-
-__all__ = ["train_ranker"]
+"""Compat shim → llm4rec.workflows.mllm4rec._stack.ranker."""
+from llm4rec.workflows.mllm4rec._stack.ranker import *  # noqa: F403

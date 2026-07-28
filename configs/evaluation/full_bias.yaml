@@ -1,0 +1,17 @@
+evaluation:
+  name: full_bias
+  top_k: [1, 5, 10]
+  metrics:
+    - hr
+    - recall
+    - ndcg
+    - mrr
+  bias:
+    - popularity_bias
+    - position_bias
+    - framing_bias
+    - history_bias
+  generation:
+    - sid_validity
+    - semantic_collision
+    - generation_accuracy

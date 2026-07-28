@@ -1,8 +1,9 @@
 # llm4rec-bias-Integrated
 
-配置驱动的 LLM 推荐实验框架：SFT → GRPO → 评测 / bias probes，并集成 MLLM4Rec（Retriever + Ranker）。
+模块化 **LLM4Rec Research Framework**：在同一工程中独立维护 MiniOneRec / MLLM4Rec / GRPO4Rec 三条 workflow，共享 Dataset / Model / Trainer / Reward / Evaluation 插件。
 
-上游参考：[llm4rec-bias](https://github.com/dragonfly90/llm4rec-bias)。
+上游参考：[llm4rec-bias](https://github.com/dragonfly90/llm4rec-bias)。  
+架构说明：[重构计划](docs/refactor_plan.md) · [迁移指南](docs/migration_guide.md)。
 
 ## 环境
 
@@ -14,7 +15,7 @@ conda activate bias
 cd llm4rec-bias-Integrated
 pip install -r requirements.txt
 pip install -e .
-python -m llm4rec_bias_Integrated.cli.main validate experiment=smoke_test
+python -m llm4rec.cli.main validate experiment=smoke_test
 ```
 
 MLLM 拉海报需要 `export TMDB_API_KEY=...`（勿写入仓库）。
@@ -39,14 +40,17 @@ MLLM 拉海报需要 `export TMDB_API_KEY=...`（勿写入仓库）。
 
 ## 配置
 
-命令只写**阶段**与 **experiment**；硬件 / 规模用 compose：
+统一 compose（Hydra 风格）：
 
 ```bash
 export LLM4REC_COMPOSE="hardware=multi scale=full"   # 默认 single + smoke
 export PYTHONPATH=src
 
-python -m llm4rec_bias_Integrated.cli.main prepare experiment=smoke_test
-python -m llm4rec_bias_Integrated.cli.main train experiment=smoke_grpo
+python train.py workflow=grpo4rec dataset=ml1m model=qwen25_3b \
+  reward=bias_aware evaluation=full_bias
+
+python -m llm4rec.cli.main prepare experiment=smoke_test
+python -m llm4rec.cli.main train experiment=smoke_grpo
 ```
 
 | 开关 | 文件 | 作用 |
@@ -54,8 +58,11 @@ python -m llm4rec_bias_Integrated.cli.main train experiment=smoke_grpo
 | `hardware=single\|multi` | `configs/hardware/` | GPU、NCCL、是否自动多卡启动 |
 | `scale=smoke\|full` | `configs/scale/` | 数据/步数限制 |
 | `experiment=…` | `configs/experiments/` | 任务、模型、训练阶段 |
+| `workflow=…` | `configs/workflows/` | minionerec / mllm4rec / grpo4rec |
+| `reward=…` | `configs/reward/` | 可组合 reward 插件 |
+| `evaluation=…` | `configs/evaluation/` | ranking / full_bias 等 |
 
-改卡号或 NCCL：编辑 `configs/hardware/*.yaml`，不必在 shell 里堆环境变量。
+旧包名 `llm4rec_bias_Integrated.*` 仍可用（兼容 shim）。
 
 ## 三条路线
 
@@ -68,11 +75,11 @@ python -m llm4rec_bias_Integrated.cli.main train experiment=smoke_grpo
 手动 MLLM 示例：
 
 ```bash
-python -m llm4rec_bias_Integrated.data.mllm4rec.cli build \
+python -m llm4rec.workflows.mllm4rec.data.cli build \
   --config configs/dataset/mllm4rec_ml100k.yaml
-python -m llm4rec_bias_Integrated.mllm4rec.cli train-retriever \
+python -m llm4rec.workflows.mllm4rec._stack.cli train-retriever \
   --config configs/training/mllm4rec_retriever.yaml
-python -m llm4rec_bias_Integrated.mllm4rec.cli train-ranker \
+python -m llm4rec.workflows.mllm4rec._stack.cli train-ranker \
   --config configs/training/mllm4rec_ranker.yaml \
   --retrieved-pkl experiments/lru/ml-100k/retrieved.pkl
 ```
@@ -81,8 +88,10 @@ python -m llm4rec_bias_Integrated.mllm4rec.cli train-ranker \
 
 ```text
 config.yaml                 # 全局默认
-configs/                    # hardware / scale / experiments / …
-src/llm4rec_bias_Integrated/
+configs/                    # hardware / scale / experiments / reward / evaluation …
+src/llm4rec/                # 研究框架（canonical）
+src/llm4rec_bias_Integrated/  # 兼容 re-export
+train.py                    # 统一入口
 scripts/                    # 共享脚本与 MLLM 辅助
 data/                       # raw | processed | preprocessed（不入库）
 runs/                       # Letter / SID 输出（不入库）
@@ -93,19 +102,21 @@ logs/                       # 运行日志（不入库）
 ## 评测
 
 ```bash
-python -m llm4rec_bias_Integrated.cli.main evaluate run_dir=runs/.../
-python -m llm4rec_bias_Integrated.cli.main evaluate run_dir=runs/.../ \
+python -m llm4rec.cli.main evaluate run_dir=runs/.../
+python -m llm4rec.cli.main evaluate run_dir=runs/.../ \
   evaluation.predictions_only=true          # 可不占 GPU
-python -m llm4rec_bias_Integrated.cli.main analyze \
+python -m llm4rec.cli.main analyze \
   experiment=smoke_probes run_dir=runs/.../
 ```
 
 ## 文档与测试
 
+- [重构计划](docs/refactor_plan.md)
+- [迁移指南](docs/migration_guide.md)
 - [多模态数据流水线](docs/mllm4rec_data_pipeline.md)
-- [官方 schema 对照](docs/mllm4rec_data_compatibility_report.md)
 
 ```bash
+python -m pytest tests/framework -q
 python -m pytest tests/unit -q
 python -m pytest tests/data/mllm4rec tests/mllm4rec -q
 ```

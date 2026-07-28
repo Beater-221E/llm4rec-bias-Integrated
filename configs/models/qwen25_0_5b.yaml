@@ -1,0 +1,3 @@
+model:
+  name: qwen2.5-0.5b-instruct
+  checkpoint: Qwen/Qwen2.5-0.5B-Instruct

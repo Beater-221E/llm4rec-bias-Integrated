@@ -1,1 +1,1 @@
-"""Data pipelines (MLLM4Rec official-compatible and extensions)."""
+"""Compatibility package."""

@@ -1,19 +1,2 @@
-"""Sampling package."""
-
-from llm4rec_bias_Integrated.datasets.sampling.base import (
-    ExposureMatchedNegativeSampler,
-    HardNegativeSampler,
-    NegativeSampler,
-    PopularityNegativeSampler,
-    UniformNegativeSampler,
-    get_sampler,
-)
-
-__all__ = [
-    "ExposureMatchedNegativeSampler",
-    "HardNegativeSampler",
-    "NegativeSampler",
-    "PopularityNegativeSampler",
-    "UniformNegativeSampler",
-    "get_sampler",
-]
+"""Compat shim → llm4rec.components.dataset._impl.sampling."""
+from llm4rec.components.dataset._impl.sampling import *  # noqa: F403

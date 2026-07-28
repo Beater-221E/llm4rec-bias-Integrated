@@ -1,0 +1,8 @@
+reward:
+  name: default
+  components:
+    - exact_match
+    - format_validity
+  weights:
+    exact_match: 1.0
+    format_validity: 0.2

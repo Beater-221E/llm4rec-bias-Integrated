@@ -1,5 +1,1 @@
-"""Popularity negative sampler (re-export)."""
-
-from llm4rec_bias_Integrated.datasets.sampling.base import PopularityNegativeSampler
-
-__all__ = ["PopularityNegativeSampler"]
+from llm4rec.components.dataset._impl.sampling.popularity import *  # noqa: F403

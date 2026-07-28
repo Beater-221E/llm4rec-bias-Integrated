@@ -1,13 +1,2 @@
-"""Prompts package."""
-
-from llm4rec_bias_Integrated.prompts.candidate_choice import (
-    LETTERS,
-    build_candidate_choice_messages,
-    parse_choice,
-)
-
-__all__ = [
-    "LETTERS",
-    "build_candidate_choice_messages",
-    "parse_choice",
-]
+"""Compat shim → llm4rec.components.prompts."""
+from llm4rec.components.prompts import *  # noqa: F403

@@ -1,3 +1,5 @@
-"""Public package marker for llm4rec-bias-Integrated."""
+"""Compatibility package — re-exports llm4rec Research Framework."""
 
-__version__ = "0.1.0"
+from llm4rec import __version__
+
+__all__ = ["__version__"]
