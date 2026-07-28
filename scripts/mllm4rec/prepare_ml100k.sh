@@ -15,11 +15,11 @@ for a in "$@"; do
 done
 if [[ "$WITH_MM" -eq 1 ]]; then
   python -m llm4rec_bias_Integrated.data.mllm4rec.cli build \
-    --config configs/dataset/mllm4rec_ml100k.yaml \
+    --config mllm4rec_ml100k \
     "${ARGS[@]}"
 else
   python -m llm4rec_bias_Integrated.data.mllm4rec.cli build \
-    --config configs/dataset/mllm4rec_ml100k.yaml \
+    --config mllm4rec_ml100k \
     --skip-multimodal \
     "${ARGS[@]}"
 fi

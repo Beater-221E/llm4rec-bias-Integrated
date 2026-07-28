@@ -1,122 +1,102 @@
 # llm4rec-bias-Integrated
 
-模块化 **LLM4Rec Research Framework**：在同一工程中独立维护 MiniOneRec / MLLM4Rec / GRPO4Rec 三条 workflow，共享 Dataset / Model / Trainer / Reward / Evaluation 插件。
-
-上游参考：[llm4rec-bias](https://github.com/dragonfly90/llm4rec-bias)。  
-架构说明：[重构计划](docs/refactor_plan.md) · [迁移指南](docs/migration_guide.md)。
+三条独立路线：**grpo4rec** / **minionerec** / **mllm4rec**。  
+配置全在根目录 `config.yaml`：每条路线下再分训练阶段。
 
 ## 环境
-
-- Python ≥ 3.11，**需要 CUDA**
-- 推荐 conda 环境 `bias`（V100 用 `float16`）
 
 ```bash
 conda activate bias
 cd llm4rec-bias-Integrated
-pip install -r requirements.txt
-pip install -e .
+pip install -r requirements.txt && pip install -e .
+export PYTHONPATH=src
 python -m llm4rec.cli.main validate experiment=smoke_test
 ```
 
-MLLM 拉海报需要 `export TMDB_API_KEY=...`（勿写入仓库）。
+## 数据集怎么建
 
-## 一键运行
+三条路线**不共用同一份预处理结果**，先建好再训。
 
-终端只显示进度；完整日志写入 `logs/*.txt`（每次覆盖）。
+### grpo4rec（Letter）
 
-| 脚本 | 内容 | 默认 |
-|------|------|------|
-| `./smoke.sh` | 三条路线限步冒烟 | 单卡 `scale=smoke` |
-| `./grpo4rec.sh` | Letter：prepare → SFT/GRPO → eval | 多卡 `scale=full` |
-| `./minionerec.sh` | SID：同上 | 多卡 `scale=full` |
-| `./mllm4rec.sh` | Retriever → Ranker | 单卡 CLI |
+经典 GroupLens **MovieLens-100K**（`u.data` / `u.item`）。
 
 ```bash
-./smoke.sh
-./grpo4rec.sh                 # 单卡：HARDWARE=single ./grpo4rec.sh
+python -m llm4rec.cli.main prepare experiment=smoke_test dataset=movielens_100k
+```
+
+会下载到 `data/raw/movielens_100k/`，预处理写入 `data/processed/movielens_100k/`（交互、划分、流行度等）。  
+`train` 时若已有 processed，会复用。
+
+### minionerec（SID）
+
+与 grpo4rec **同一套** MovieLens-100K processed，再额外建 Semantic ID：
+
+```bash
+python -m llm4rec.cli.main prepare experiment=smoke_sid
+```
+
+在 `data/processed/movielens_100k/sid/` 生成 codebook / `sid_*.jsonl`。  
+`train experiment=smoke_sid` 若发现 SID 缺失也会补建。
+
+### mllm4rec（Retriever + Ranker）
+
+官方兼容管线：配置里的 `ml-100k` = GroupLens **ml-latest-small**（不是上面的 classic 100K）。
+
+```bash
+# 仅交互/标题 → dataset.pkl（冒烟够用）
+python -m llm4rec_bias_Integrated.data.mllm4rec.cli build \
+  --config mllm4rec_ml100k --skip-multimodal
+
+# 完整多模态（海报 + BLIP2 caption）需要 API
+export TMDB_API_KEY=...
+python -m llm4rec_bias_Integrated.data.mllm4rec.cli build --config mllm4rec_ml100k
+```
+
+产物：`data/preprocessed/ml-100k_min_rating0-min_uc5-min_sc5/dataset.pkl`（及 img/captions 等）。
+
+| 路线 | 语料 | 主要产物 |
+|------|------|----------|
+| grpo4rec | classic ML-100K | `data/processed/movielens_100k/` |
+| minionerec | 同上 + SID | `.../sid/` |
+| mllm4rec | ml-latest-small | `data/preprocessed/.../dataset.pkl` |
+
+## 一键跑
+
+**`./smoke.sh` 假定数据已就绪**（不会帮你下全量多模态）。跑之前至少要有：
+
+- `data/processed/movielens_100k/`（Letter / SID）
+- `data/preprocessed/ml-100k_min_rating0-min_uc5-min_sc5/dataset.pkl`（MLLM；可用上面 `--skip-multimodal` 生成）
+
+```bash
+./smoke.sh                # 三条路线限步冒烟（单卡）
+./grpo4rec.sh             # 单卡：HARDWARE=single ./grpo4rec.sh
 ./minionerec.sh
-./mllm4rec.sh
+./mllm4rec.sh             # 无完整 pkl+caption 时需要 TMDB_API_KEY
 ```
 
-## 配置
+## 配置怎么读
 
-统一 compose（Hydra 风格）：
+```text
+config.yaml
+├── grpo4rec/     sft / grpo / evaluate / analyze + smoke|full
+├── minionerec/   prepare / sft / grpo / evaluate + smoke|full
+└── mllm4rec/     data / retriever / ranker + smoke|full
+```
 
 ```bash
-export LLM4REC_COMPOSE="hardware=multi scale=full"   # 默认 single + smoke
-export PYTHONPATH=src
-
-python train.py workflow=grpo4rec dataset=ml1m model=qwen25_3b \
-  reward=bias_aware evaluation=full_bias
-
-python -m llm4rec.cli.main prepare experiment=smoke_test
 python -m llm4rec.cli.main train experiment=smoke_grpo
-```
+python -m llm4rec.cli.main train experiment=smoke_sid hardware=multi scale=full
+python -m llm4rec.cli.main train workflow=grpo4rec scale=smoke
 
-| 开关 | 文件 | 作用 |
-|------|------|------|
-| `hardware=single\|multi` | `configs/hardware/` | GPU、NCCL、是否自动多卡启动 |
-| `scale=smoke\|full` | `configs/scale/` | 数据/步数限制 |
-| `experiment=…` | `configs/experiments/` | 任务、模型、训练阶段 |
-| `workflow=…` | `configs/workflows/` | minionerec / mllm4rec / grpo4rec |
-| `reward=…` | `configs/reward/` | 可组合 reward 插件 |
-| `evaluation=…` | `configs/evaluation/` | ranking / full_bias 等 |
-
-旧包名 `llm4rec_bias_Integrated.*` 仍可用（兼容 shim）。
-
-## 三条路线
-
-| 路线 | 实验 | 输出 |
-|------|------|------|
-| **grpo4rec**（Letter） | `smoke_grpo` | `runs/.../grpo4rec/` |
-| **minionerec**（SID） | `smoke_sid` | `runs/.../minionerec/` |
-| **mllm4rec** | Retriever / Ranker YAML | `experiments/lru/`、`experiments/ranker/` |
-
-手动 MLLM 示例：
-
-```bash
-python -m llm4rec.workflows.mllm4rec.data.cli build \
-  --config configs/dataset/mllm4rec_ml100k.yaml
-python -m llm4rec.workflows.mllm4rec._stack.cli train-retriever \
-  --config configs/training/mllm4rec_retriever.yaml
-python -m llm4rec.workflows.mllm4rec._stack.cli train-ranker \
-  --config configs/training/mllm4rec_ranker.yaml \
+python -m llm4rec_bias_Integrated.mllm4rec.cli train-retriever --config mllm4rec_retriever
+python -m llm4rec_bias_Integrated.mllm4rec.cli train-ranker --config mllm4rec_ranker \
   --retrieved-pkl experiments/lru/ml-100k/retrieved.pkl
 ```
 
-## 目录
-
-```text
-config.yaml                 # 全局默认
-configs/                    # hardware / scale / experiments / reward / evaluation …
-src/llm4rec/                # 研究框架（canonical）
-src/llm4rec_bias_Integrated/  # 兼容 re-export
-train.py                    # 统一入口
-scripts/                    # 共享脚本与 MLLM 辅助
-data/                       # raw | processed | preprocessed（不入库）
-runs/                       # Letter / SID 输出（不入库）
-experiments/                # MLLM 输出（不入库）
-logs/                       # 运行日志（不入库）
-```
-
-## 评测
+## 测试 / 清理
 
 ```bash
-python -m llm4rec.cli.main evaluate run_dir=runs/.../
-python -m llm4rec.cli.main evaluate run_dir=runs/.../ \
-  evaluation.predictions_only=true          # 可不占 GPU
-python -m llm4rec.cli.main analyze \
-  experiment=smoke_probes run_dir=runs/.../
-```
-
-## 文档与测试
-
-- [重构计划](docs/refactor_plan.md)
-- [迁移指南](docs/migration_guide.md)
-- [多模态数据流水线](docs/mllm4rec_data_pipeline.md)
-
-```bash
-python -m pytest tests/framework -q
-python -m pytest tests/unit -q
-python -m pytest tests/data/mllm4rec tests/mllm4rec -q
+make test
+make clean    # 清缓存与 runs（保留 data/raw）
 ```

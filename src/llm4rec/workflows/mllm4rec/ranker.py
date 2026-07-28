@@ -5,9 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from omegaconf import OmegaConf
-
 from llm4rec.core.paths import project_root
+from llm4rec.core.profile_io import load_yaml_or_profile
 from llm4rec.workflows.mllm4rec._stack.ranker.train import RankerConfig, train_ranker
 
 
@@ -43,11 +42,7 @@ def train_ranker_from_config(
     retrieved_pkl: Path | None = None,
     dataset_pkl: Path | None = None,
 ) -> dict[str, Any]:
-    path = Path(config_path)
-    if not path.is_absolute():
-        path = project_root() / path
-    raw = OmegaConf.to_container(OmegaConf.load(path), resolve=True)
-    assert isinstance(raw, dict)
+    raw = load_yaml_or_profile(config_path, default_slots=("training",))
     cfg = _as_ranker_config(raw, retrieved_pkl=retrieved_pkl, dataset_pkl=dataset_pkl)
     out = train_ranker(cfg)
     metrics_path = Path(cfg.export_root) / "test_metrics.json"

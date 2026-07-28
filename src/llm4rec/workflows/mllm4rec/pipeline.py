@@ -97,8 +97,8 @@ class MLLM4RecWorkflow(BaseWorkflow):
 
         summary: dict[str, Any] = {}
         mllm_cfg = self.context.config.get("mllm4rec") or {}
-        retriever_cfg = mllm_cfg.get("retriever_config") or "configs/training/mllm4rec_retriever.yaml"
-        ranker_cfg = mllm_cfg.get("ranker_config") or "configs/training/mllm4rec_ranker.yaml"
+        retriever_cfg = mllm_cfg.get("retriever_config") or "mllm4rec_retriever"
+        ranker_cfg = mllm_cfg.get("ranker_config") or "mllm4rec_ranker"
 
         ret = train_retriever_from_config(retriever_cfg, dataset_pkl=self._dataset_pkl)
         summary["retriever"] = ret

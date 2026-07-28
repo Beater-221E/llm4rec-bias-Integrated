@@ -1,4 +1,4 @@
-"""YAML config loading, composition, validation, and CLI overrides."""
+"""YAML config loading: three routes × training stages."""
 
 from __future__ import annotations
 
@@ -9,26 +9,14 @@ from typing import Any
 from omegaconf import DictConfig, OmegaConf
 
 from llm4rec.core.exceptions import ConfigurationError
-from llm4rec.core.paths import base_config_path, configs_dir, project_root
+from llm4rec.core.paths import base_config_path, project_root
 
-# Named composition slots → subdirectory under configs/
-# Prefer plural dirs used historically; also resolve singular aliases in _resolve_named_file.
-_COMPOSE_SLOTS: dict[str, str] = {
-    "dataset": "datasets",
-    "model": "models",
-    "workflow": "workflows",
-    "training": "training",
-    "bias": "bias",
-    "reward": "reward",
-    "evaluation": "evaluation",
-    "experiment": "experiments",
-    "scale": "scale",
-    "hardware": "hardware",
-}
+_ROUTES = ("grpo4rec", "minionerec", "mllm4rec")
 
-# Apply selectors in this order so hardware/scale always win over experiment embeds.
-_SELECTOR_ORDER: tuple[str, ...] = (
-    "experiment",
+# Stage keys under each letter/SID route (merged into active runtime config)
+_LETTER_STAGES = ("prepare", "sft", "grpo", "evaluate", "analyze")
+
+_COMPOSE_SLOTS = {
     "dataset",
     "model",
     "workflow",
@@ -36,12 +24,12 @@ _SELECTOR_ORDER: tuple[str, ...] = (
     "bias",
     "reward",
     "evaluation",
+    "experiment",
     "scale",
     "hardware",
-)
+}
 
-# Default profiles when CLI / LLM4REC_COMPOSE omit them.
-_DEFAULT_SELECTORS: dict[str, str] = {
+_DEFAULT_SELECTORS = {
     "hardware": "single",
     "scale": "smoke",
 }
@@ -66,13 +54,10 @@ def _as_dict(cfg: DictConfig | dict[str, Any]) -> dict[str, Any]:
 
 
 def parse_overrides(tokens: list[str]) -> dict[str, Any]:
-    """Parse Hydra-style ``key=value`` / ``key.nested=value`` tokens."""
     overrides: dict[str, Any] = {}
     for token in tokens:
         if "=" not in token:
-            raise ConfigurationError(
-                f"Invalid override '{token}'. Expected key=value"
-            )
+            raise ConfigurationError(f"Invalid override '{token}'. Expected key=value")
         key, raw = token.split("=", 1)
         key = key.strip()
         if not key:
@@ -88,7 +73,6 @@ def _parse_scalar(raw: str) -> Any:
         return True
     if raw.lower() == "false":
         return False
-    # list / dict literals via YAML
     if raw.startswith("[") or raw.startswith("{"):
         try:
             return OmegaConf.to_container(OmegaConf.create(raw), resolve=True)
@@ -108,53 +92,43 @@ def _load_yaml(path: Path) -> DictConfig:
     return OmegaConf.load(path)  # type: ignore[return-value]
 
 
-def _resolve_named_file(slot: str, name: str, root: Path) -> Path:
-    sub = _COMPOSE_SLOTS[slot]
-    # Singular aliases for dataset / reward / evaluation layout.
-    alt_subs = {
-        "datasets": ["dataset"],
-        "dataset": ["datasets"],
-        "reward": ["rewards"],
-        "evaluation": ["eval", "evaluations"],
-    }
-    subdirs = [sub, *alt_subs.get(sub, [])]
-    # allow either dash or underscore file names
-    candidates: list[Path] = []
-    for directory in subdirs:
-        candidates.extend(
-            [
-                root / directory / f"{name}.yaml",
-                root / directory / f"{name.replace('-', '_')}.yaml",
-                root / directory / f"{name.replace('_', '-')}.yaml",
-            ]
-        )
-    for path in candidates:
-        if path.is_file():
-            return path
-    raise ConfigurationError(
-        f"No config for {slot}='{name}' under {root / sub}"
-    )
-
-
 def _apply_dot_overrides(cfg: DictConfig, overrides: dict[str, Any]) -> DictConfig:
     for key, value in overrides.items():
         OmegaConf.update(cfg, key, value, merge=True)
     return cfg
 
 
-def _lookup_model_alias(models_map: DictConfig, name: str) -> DictConfig | None:
-    alias = OmegaConf.select(models_map, name)
-    if alias is not None:
-        return alias  # type: ignore[return-value]
-    target = name.replace("_", "-")
-    for key in models_map:
-        if str(key).replace("_", "-") == target:
-            return models_map[key]  # type: ignore[return-value]
-    return None
+def _node_as_dict(node: Any) -> dict[str, Any]:
+    if node is None:
+        return {}
+    if isinstance(node, DictConfig):
+        out = OmegaConf.to_container(node, resolve=False)
+        return dict(out) if isinstance(out, dict) else {}
+    if isinstance(node, dict):
+        return dict(node)
+    return {}
+
+
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    return _as_dict(OmegaConf.merge(OmegaConf.create(base), OmegaConf.create(overlay)))
+
+
+def _lookup_model_alias(models_map: DictConfig | dict[str, Any] | None, name: str) -> Any:
+    if models_map is None:
+        return None
+    if isinstance(models_map, DictConfig):
+        alias = OmegaConf.select(models_map, name)
+        if alias is not None:
+            return alias
+        target = name.replace("_", "-")
+        for key in models_map:
+            if str(key).replace("_", "-") == target:
+                return models_map[key]
+        return None
+    return models_map.get(name) or models_map.get(name.replace("_", "-"))
 
 
 def _resolve_model_alias(cfg: DictConfig, *, force: bool = False) -> None:
-    """Map model.name aliases (e.g. qwen2.5-1b) to checkpoint via models map."""
     models_map = OmegaConf.select(cfg, "models")
     model_cfg = OmegaConf.select(cfg, "model")
     if models_map is None or model_cfg is None:
@@ -165,19 +139,13 @@ def _resolve_model_alias(cfg: DictConfig, *, force: bool = False) -> None:
     alias = _lookup_model_alias(models_map, str(name))
     if alias is None:
         return
-    ckpt = OmegaConf.select(alias, "checkpoint")
+    ckpt = OmegaConf.select(alias, "checkpoint") if isinstance(alias, DictConfig) else alias.get("checkpoint")
     current = OmegaConf.select(model_cfg, "checkpoint")
     if ckpt and (force or current in (None, "", "???")):
         OmegaConf.update(cfg, "model.checkpoint", ckpt, merge=False)
 
 
 def env_compose_overrides() -> list[str]:
-    """Parse ``LLM4REC_COMPOSE`` (space-separated Hydra-style tokens).
-
-    Example::
-
-        export LLM4REC_COMPOSE="hardware=multi scale=full"
-    """
     raw = os.environ.get("LLM4REC_COMPOSE", "").strip()
     if not raw:
         return []
@@ -185,12 +153,6 @@ def env_compose_overrides() -> list[str]:
 
 
 def apply_hardware_env(cfg: DictConfig | dict[str, Any]) -> None:
-    """Apply ``hardware.cuda_visible_devices`` / ``hardware.env`` to ``os.environ``.
-
-    Call before any CUDA init (``require_cuda`` / ``torch.cuda``).
-    Explicit shell exports for NCCL_* win via ``setdefault``; CUDA devices from
-    the resolved hardware profile always apply so YAML is the source of truth.
-    """
     if isinstance(cfg, DictConfig):
         hw = OmegaConf.select(cfg, "hardware")
         hw_dict = OmegaConf.to_container(hw, resolve=True) if hw is not None else {}
@@ -198,11 +160,9 @@ def apply_hardware_env(cfg: DictConfig | dict[str, Any]) -> None:
         hw_dict = cfg.get("hardware") or {}
     if not isinstance(hw_dict, dict):
         return
-
     devices = hw_dict.get("cuda_visible_devices")
     if devices is not None and str(devices).strip() != "":
         os.environ["CUDA_VISIBLE_DEVICES"] = str(devices)
-
     env_map = hw_dict.get("env") or {}
     if isinstance(env_map, dict):
         for key, value in env_map.items():
@@ -211,97 +171,229 @@ def apply_hardware_env(cfg: DictConfig | dict[str, Any]) -> None:
             os.environ.setdefault(str(key), str(value))
 
 
+def _experiment_spec(root: DictConfig, name: str) -> dict[str, Any]:
+    node = OmegaConf.select(root, f"experiments.{name}")
+    if node is None:
+        raise ConfigurationError(f"Unknown experiment='{name}' (see config.yaml experiments:)")
+    return _node_as_dict(node)
+
+
+def _flatten_route(
+    root: DictConfig,
+    route: str,
+    *,
+    stages: list[str],
+    scale: str,
+    extra_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a flat runtime config from ``<route>.{shared,stages,scale}``."""
+    route_node = OmegaConf.select(root, route)
+    if route_node is None:
+        raise ConfigurationError(f"Unknown workflow/route '{route}'")
+    route_cfg = _node_as_dict(route_node)
+
+    # Shared route fields (not stage / scale keys)
+    skip = set(_LETTER_STAGES) | {"smoke", "full", "data", "retriever", "ranker", "name"}
+    active: dict[str, Any] = {
+        k: v for k, v in route_cfg.items() if k not in skip and not k.startswith("_")
+    }
+
+    # Merge each requested stage block
+    for stage in stages:
+        if stage in {"report", "prepare"} and stage not in route_cfg:
+            continue
+        block = _node_as_dict(route_cfg.get(stage))
+        if not block:
+            continue
+        # Stage blocks already wrap training:/grpo:/evaluation: etc.
+        active = _deep_merge(active, block)
+
+    # Scale preset on the route (smoke / full)
+    preset = _node_as_dict(route_cfg.get(scale))
+    if preset:
+        # preset may nest stage overrides: sft: {training: ...}
+        flat_preset: dict[str, Any] = {}
+        for key, value in preset.items():
+            if key in _LETTER_STAGES or key in {"retriever", "ranker", "data"}:
+                flat_preset = _deep_merge(flat_preset, _node_as_dict(value))
+            else:
+                flat_preset[key] = value
+        active = _deep_merge(active, flat_preset)
+
+    if extra_overrides:
+        active = _deep_merge(active, extra_overrides)
+
+    # Ensure training.stages lists the pipeline to run
+    training = dict(active.get("training") or {})
+    training["stages"] = list(stages)
+    active["training"] = training
+
+    # Ensure workflow.name
+    wf = dict(active.get("workflow") or {})
+    wf.setdefault("name", route)
+    active["workflow"] = wf
+
+    return active
+
+
+def _apply_hardware(root: DictConfig, active: dict[str, Any], hardware: str) -> dict[str, Any]:
+    node = OmegaConf.select(root, f"hardware_profiles.{hardware}")
+    if node is None:
+        # allow legacy key hardware.single
+        node = OmegaConf.select(root, f"hardware.{hardware}")
+    if node is None:
+        raise ConfigurationError(f"Unknown hardware='{hardware}'")
+    return _deep_merge(active, _node_as_dict(node))
+
+
+def load_profile(slot: str, name: str) -> dict[str, Any]:
+    """Load a route stage fragment for MLLM CLI.
+
+    Accepts names like ``mllm4rec_retriever``, ``mllm4rec.retriever``,
+    ``retriever``, ``mllm4rec_ml100k``, ``mllm4rec.data.ml100k``.
+    """
+    root = _load_yaml(base_config_path())
+    text = name.strip()
+    # Normalize aliases
+    aliases = {
+        "mllm4rec_retriever": ("mllm4rec", "retriever"),
+        "mllm4rec_ranker": ("mllm4rec", "ranker"),
+        "mllm4rec_ml100k": ("mllm4rec", "data", "ml100k"),
+        "mllm4rec_ml1m": ("mllm4rec", "data", "ml1m"),
+    }
+    if text in aliases:
+        path = ".".join(aliases[text])
+        node = OmegaConf.select(root, path)
+        if node is not None:
+            return _node_as_dict(node)
+
+    # dotted path: mllm4rec.retriever / mllm4rec.data.ml100k
+    if "." in text:
+        node = OmegaConf.select(root, text)
+        if node is not None:
+            return _node_as_dict(node)
+
+    # bare stage under mllm4rec
+    for path in (f"mllm4rec.{text}", f"mllm4rec.data.{text}", text):
+        node = OmegaConf.select(root, path)
+        if node is not None:
+            return _node_as_dict(node)
+
+    raise ConfigurationError(
+        f"Unknown profile '{name}'. Use e.g. mllm4rec_retriever / mllm4rec.data.ml100k"
+    )
+
+
 def load_config(
     overrides: list[str] | None = None,
     *,
     config_root: Path | None = None,
     apply_env: bool = True,
 ) -> DictConfig:
-    """Load base config, compose named YAMLs, apply CLI overrides.
-
-    Base file is ``<project_root>/config.yaml``. Named selectors
-    (``experiment=…``, ``hardware=…``, ``scale=…``, …) load matching files under
-    ``configs/<slot>/``. Defaults: ``hardware=single``, ``scale=smoke``.
-    Selector merge order puts ``scale`` then ``hardware`` last so they override
-    experiment embeds. Optional ``LLM4REC_COMPOSE`` tokens are prepended by the
-    CLI before this function sees ``overrides``.
-
-    ``config_root`` overrides the compose directory (default ``configs/``);
-    the base ``config.yaml`` always resolves from the project root unless
-    ``config_root`` itself contains a ``config.yaml`` (test override).
-    """
-    compose_root = config_root or configs_dir()
+    """Compose runtime config from route × stages × scale × hardware."""
     base_path = base_config_path()
     if config_root is not None and (config_root / "config.yaml").is_file():
         base_path = config_root / "config.yaml"
-    cfg = _load_yaml(base_path)
+    root = _load_yaml(base_path)
 
     parsed = parse_overrides(overrides or [])
+    cli_selectors = {k: parsed.pop(k) for k in list(parsed) if k in _COMPOSE_SLOTS}
+    selectors = {**_DEFAULT_SELECTORS, **cli_selectors}
 
-    # First pass: apply selectors that choose composition files (fixed order).
-    selectors: dict[str, Any] = {
-        slot: parsed.pop(slot) for slot in list(parsed) if slot in _COMPOSE_SLOTS
+    # Resolve experiment → workflow/scale/stages
+    exp_name = selectors.get("experiment")
+    exp_spec: dict[str, Any] = {}
+    if isinstance(exp_name, str):
+        exp_spec = _experiment_spec(root, exp_name)
+        if "workflow" not in cli_selectors and exp_spec.get("workflow"):
+            selectors["workflow"] = exp_spec["workflow"]
+        if "scale" not in cli_selectors and exp_spec.get("scale"):
+            selectors["scale"] = exp_spec["scale"]
+
+    workflow = selectors.get("workflow")
+    if not isinstance(workflow, str):
+        workflow = "grpo4rec"
+    if workflow not in _ROUTES:
+        raise ConfigurationError(f"workflow must be one of {_ROUTES}, got {workflow!r}")
+
+    scale = str(selectors.get("scale") or "smoke")
+    hardware = str(selectors.get("hardware") or "single")
+    stages = list(exp_spec.get("stages") or ["sft", "evaluate"])
+    extra = dict(exp_spec.get("overrides") or {})
+
+    # Allow workflow= without experiment: use a sensible default stage set
+    if not isinstance(exp_name, str):
+        if workflow == "mllm4rec":
+            stages = ["retriever", "ranker"]
+        else:
+            stages = ["sft", "grpo", "evaluate"]
+
+    active = _flatten_route(
+        root,
+        workflow,
+        stages=[s for s in stages if s not in {"report"}],
+        scale=scale,
+        extra_overrides=extra,
+    )
+    active = _apply_hardware(root, active, hardware)
+
+    # Global bits
+    for key in ("paths", "models", "tracking"):
+        if key not in active and OmegaConf.select(root, key) is not None:
+            active[key] = _node_as_dict(OmegaConf.select(root, key))
+    if "seed" not in active:
+        active["seed"] = OmegaConf.select(root, "seed") or 42
+
+    # Experiment metadata
+    active["experiment"] = {
+        "name": str(exp_name or f"{workflow}_{scale}"),
+        "seed": int(active.get("seed") or 42),
     }
-    for slot, default_name in _DEFAULT_SELECTORS.items():
-        selectors.setdefault(slot, default_name)
+    active["scale"] = {"name": scale}
 
-    model_selector_used = "model" in selectors
-    for slot in _SELECTOR_ORDER:
-        if slot not in selectors:
-            continue
-        name = selectors[slot]
-        if not isinstance(name, str):
-            raise ConfigurationError(f"{slot} selector must be a string, got {name!r}")
-        if slot == "model":
-            # Prefer alias map (qwen2.5-1b); fall back to models/*.yaml file names.
-            OmegaConf.update(cfg, "model.name", name, merge=False)
-            try:
-                named = _load_yaml(_resolve_named_file(slot, name, compose_root))
-                cfg = OmegaConf.merge(cfg, named)
-            except ConfigurationError:
-                pass
-            continue
-        named = _load_yaml(_resolve_named_file(slot, name, compose_root))
-        cfg = OmegaConf.merge(cfg, named)
+    active.setdefault("evaluation", {"top_k": [1, 5, 10], "use_upstream_eval": True})
+    active.setdefault("tracking", _node_as_dict(OmegaConf.select(root, "tracking")))
+    active.setdefault("paths", _node_as_dict(OmegaConf.select(root, "paths")))
 
-    # Explicit checkpoint override wins over alias force-refresh.
+    # Optional reward / evaluation presets
+    reward_name = cli_selectors.get("reward")
+    if isinstance(reward_name, str):
+        preset = OmegaConf.select(root, f"reward_presets.{reward_name}")
+        if preset is not None:
+            active = _deep_merge(active, _node_as_dict(preset))
+    eval_name = cli_selectors.get("evaluation")
+    if isinstance(eval_name, str):
+        preset = OmegaConf.select(root, f"evaluation_presets.{eval_name}")
+        if preset is not None:
+            active = _deep_merge(active, _node_as_dict(preset))
+
+    cfg = OmegaConf.create(active)
+
+    # model= / dataset= selectors
+    model_selector_used = "model" in cli_selectors
+    if model_selector_used:
+        OmegaConf.update(cfg, "model.name", cli_selectors["model"], merge=False)
+
+    if "dataset" in cli_selectors and isinstance(cli_selectors["dataset"], str):
+        ds_name = str(cli_selectors["dataset"])
+        alias = {"ml1m": "movielens_1m", "ml100k": "movielens_100k"}.get(ds_name, ds_name)
+        OmegaConf.update(cfg, "dataset.name", alias, merge=False)
+
     explicit_checkpoint = "model.checkpoint" in parsed
     cfg = _apply_dot_overrides(cfg, parsed)
     _resolve_model_alias(cfg, force=model_selector_used and not explicit_checkpoint)
 
-    # If experiment file set nested selectors, compose those too (once)
-    for slot, subdir in _COMPOSE_SLOTS.items():
-        if slot in {"experiment", "hardware", "scale"}:
-            continue
-        name = OmegaConf.select(cfg, f"{slot}.name") or OmegaConf.select(cfg, slot)
-        if isinstance(name, str) and (compose_root / subdir / f"{name}.yaml").exists():
-            # Only merge if the named file adds fields not already fully present
-            # Skip if already merged via selector
-            if slot not in selectors:
-                named_path = _resolve_named_file(slot, name, compose_root)
-                named = _load_yaml(named_path)
-                cfg = OmegaConf.merge(cfg, named)
-
-    # Re-apply late profiles so nested experiment merges cannot clobber them.
-    for slot in ("scale", "hardware"):
-        name = selectors.get(slot)
-        if isinstance(name, str):
-            cfg = OmegaConf.merge(
-                cfg, _load_yaml(_resolve_named_file(slot, name, compose_root))
-            )
-
-    # CLI dot-overrides still win over composed profiles.
     if parsed:
         cfg = _apply_dot_overrides(cfg, parsed)
-
     _resolve_model_alias(cfg, force=model_selector_used and not explicit_checkpoint)
+
     OmegaConf.resolve(cfg)
     if apply_env:
         apply_hardware_env(cfg)
     return cfg
 
+
 def validate_config(cfg: DictConfig | dict[str, Any]) -> dict[str, Any]:
-    """Fail-fast schema checks for Phase 1 (extended in later phases)."""
     data = _as_dict(cfg) if not isinstance(cfg, dict) else cfg
     missing = [k for k in _REQUIRED_TOP_LEVEL if k not in data]
     if missing:

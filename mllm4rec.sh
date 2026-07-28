@@ -14,9 +14,9 @@ export PYTHONPATH=src
 export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
-DATASET_CFG="${DATASET_CFG:-configs/dataset/mllm4rec_ml100k.yaml}"
-RETRIEVER_CFG="${RETRIEVER_CFG:-configs/training/mllm4rec_retriever.yaml}"
-RANKER_CFG="${RANKER_CFG:-configs/training/mllm4rec_ranker.yaml}"
+DATASET_CFG="${DATASET_CFG:-mllm4rec_ml100k}"
+RETRIEVER_CFG="${RETRIEVER_CFG:-mllm4rec_retriever}"
+RANKER_CFG="${RANKER_CFG:-mllm4rec_ranker}"
 EXPORT_LRU="${EXPORT_LRU:-experiments/lru/ml-100k}"
 EXPORT_RANKER="${EXPORT_RANKER:-experiments/ranker/ml-100k}"
 PKL="${PKL:-data/preprocessed/ml-100k_min_rating0-min_uc5-min_sc5/dataset.pkl}"

@@ -1,8 +1,0 @@
-bias:
-  name: position
-  probes:
-    - position
-  position:
-    place_target_at_all_slots: true
-    compute_spread: true
-    compute_kendall: true

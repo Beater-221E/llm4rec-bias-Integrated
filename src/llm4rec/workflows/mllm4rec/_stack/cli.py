@@ -3,10 +3,10 @@
 Usage::
 
     python -m llm4rec.workflows.mllm4rec._stack.cli train-retriever \\
-      --config configs/training/mllm4rec_retriever.yaml
+      --config mllm4rec_retriever
 
     python -m llm4rec.workflows.mllm4rec._stack.cli train-ranker \\
-      --config configs/training/mllm4rec_ranker.yaml
+      --config mllm4rec_ranker
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-import yaml
+from llm4rec.core.profile_io import load_yaml_or_profile
 
 logger = logging.getLogger("llm4rec.workflows.mllm4rec._stack")
 
@@ -32,10 +32,7 @@ def _setup_logging(level: str = "INFO") -> None:
 
 
 def _load_yaml(path: str | None) -> dict:
-    if not path:
-        return {}
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    return load_yaml_or_profile(path, default_slots=("training", "mllm_dataset"))
 
 
 def cmd_train_retriever(args: argparse.Namespace) -> int:

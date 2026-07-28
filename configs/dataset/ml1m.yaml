@@ -1,3 +1,0 @@
-# Alias: dataset=ml1m → classic MovieLens-1M (Letter/SID)
-dataset:
-  name: movielens_1m

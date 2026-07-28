@@ -8,7 +8,7 @@
 Usage::
 
     python -m llm4rec.workflows.mllm4rec.data.cli preprocess \\
-      --config configs/dataset/mllm4rec_ml100k.yaml
+      --config mllm4rec_ml100k
 """
 
 from __future__ import annotations

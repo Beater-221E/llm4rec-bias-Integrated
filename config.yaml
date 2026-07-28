@@ -1,138 +1,538 @@
-# 全局默认配置（项目根目录）。用 experiment=… / hardware=… / scale=… 组合覆盖。
-# 硬件与规模：configs/hardware/{single,multi}.yaml · configs/scale/{smoke,full}.yaml
+# =============================================================================
+# llm4rec-bias-Integrated — 统一配置
+# =============================================================================
+# 结构：全局公共项 → 三条路线（grpo4rec / minionerec / mllm4rec）
+# 每条路线内再按训练阶段分块（prepare / sft / grpo / evaluate / …）
+#
+# 用法：
+#   workflow=grpo4rec scale=smoke hardware=single
+#   experiment=smoke_grpo          # 等价于上面 + 冒烟预设
+#   experiment=smoke_sid
+#   --config mllm4rec.retriever    # 或 mllm4rec_retriever
+# =============================================================================
 
-# —— 实验元信息 ——
+# —— 全局 ——
 experiment:
-  name: default          # 实验名（写入 runs/ 路径）
-  seed: 42               # 随机种子（数据划分 / 训练）
+  name: default
+  seed: 42
+seed: 42
 
-seed: 42                 # 顶层种子；与 experiment.seed 二选一，优先 experiment
-
-# —— 路径（相对项目根，除非写绝对路径）——
 paths:
-  data_root: data              # 数据总根
-  raw_dir: data/raw            # 原始下载
-  processed_dir: data/processed  # 预处理产物
-  cache_dir: data/cache        # 缓存
-  runs_dir: runs               # Letter / SID 训练输出
-  reports_dir: reports         # 汇总报告
+  data_root: data
+  raw_dir: data/raw
+  processed_dir: data/processed
+  cache_dir: data/cache
+  runs_dir: runs
+  reports_dir: reports
 
-# —— 模型别名：短名 → Hugging Face Instruct 权重 ——
-# 在此维护别名，勿在 trainer 里写死特殊逻辑；无 -instruct 的短名为兼容别名。
+# LLM 权重别名（各路线 model.name 解析用）
 models:
-  qwen2.5-0.5b-instruct:
-    checkpoint: Qwen/Qwen2.5-0.5B-Instruct
-  qwen2.5-1.5b-instruct:
-    checkpoint: Qwen/Qwen2.5-1.5B-Instruct
-  qwen2.5-3b-instruct:
-    checkpoint: Qwen/Qwen2.5-3B-Instruct
-  qwen2.5-7b-instruct:
-    checkpoint: Qwen/Qwen2.5-7B-Instruct
-  qwen2.5-0.5b:
-    checkpoint: Qwen/Qwen2.5-0.5B-Instruct
-  qwen2.5-1b:
-    checkpoint: Qwen/Qwen2.5-1.5B-Instruct  # 1b 别名映射到 1.5B
-  qwen2.5-1.5b:
-    checkpoint: Qwen/Qwen2.5-1.5B-Instruct
-  qwen2.5-3b:
-    checkpoint: Qwen/Qwen2.5-3B-Instruct
-  qwen2.5-7b:
-    checkpoint: Qwen/Qwen2.5-7B-Instruct
+  qwen2.5-0.5b-instruct: {checkpoint: Qwen/Qwen2.5-0.5B-Instruct}
+  qwen2.5-1.5b-instruct: {checkpoint: Qwen/Qwen2.5-1.5B-Instruct}
+  qwen2.5-3b-instruct: {checkpoint: Qwen/Qwen2.5-3B-Instruct}
+  qwen2.5-7b-instruct: {checkpoint: Qwen/Qwen2.5-7B-Instruct}
+  qwen2.5-0.5b: {checkpoint: Qwen/Qwen2.5-0.5B-Instruct}
+  qwen2.5-1b: {checkpoint: Qwen/Qwen2.5-1.5B-Instruct}
+  qwen2.5-1.5b: {checkpoint: Qwen/Qwen2.5-1.5B-Instruct}
+  qwen2.5-3b: {checkpoint: Qwen/Qwen2.5-3B-Instruct}
+  qwen2.5-7b: {checkpoint: Qwen/Qwen2.5-7B-Instruct}
+  qwen25_0_5b: {checkpoint: Qwen/Qwen2.5-0.5B-Instruct}
+  qwen25_3b: {checkpoint: Qwen/Qwen2.5-3B-Instruct}
 
-# —— 数据集（letter / SID 共用字段）——
-dataset:
-  name: movielens_100k       # 注册数据集名（见 configs/datasets/）
-  rating_threshold: 4.0      # ≥ 此分视为正反馈
-  split: leave_one_out       # 划分策略：leave_one_out 等
-  history_max_length: 20     # 用户历史截断长度
-  candidate_size: 8         # 候选集大小（含正样本）
-  negative_sampling: uniform # 负采样：uniform 等
-  target_position: random    # 正样本在候选中的位置：random / fixed …
-  framing: neutral           # 提示词表述：neutral / positive …
-  min_user_interactions: 5   # 过滤交互过少的用户
-  train_limit: null          # 训练样本上限；null=不截断（冒烟用 experiment 覆盖）
-  eval_limit: null           # 评测样本上限；null=不截断
-
-# —— 工作流 ——
-workflow:
-  name: grpo4rec             # grpo4rec(letter) | minionerec(SID) | mllm4rec
-  task: candidate_choice     # 任务类型：candidate_choice / semantic_id_generation …
-
-# —— 当前实验所用模型（name 可走上方 alias）——
-model:
-  name: qwen2.5-0.5b-instruct
-  checkpoint: null           # null 时由 models 别名解析
-  revision: null             # HF revision / commit；null=默认
-  dtype: float16             # 权重精度（V100 用 float16）
-  use_flash_attention: false # FlashAttention；需硬件/库支持
-  gradient_checkpointing: true  # 以算换显存
-  trust_remote_code: false   # 是否允许远端自定义代码
-
-# —— PEFT / LoRA ——
-peft:
-  enabled: true              # false=全参（7B 默认禁止，需显式确认）
-  method: lora
-  rank: 16                   # LoRA 秩
-  alpha: 32                  # LoRA 缩放
-  dropout: 0.05
-  target_modules:            # 注入 LoRA 的注意力投影层
-    - q_proj
-    - k_proj
-    - v_proj
-    - o_proj
-
-# —— 训练调度 ——
-# distributed / auto_launch_multi_gpu 由 configs/hardware/{single,multi}.yaml 提供
-training:
-  stages:                    # 流水线阶段：sft | grpo | evaluate | analyze | report
-    - sft
-    - evaluate
-  batch_size: 2              # 每卡 micro-batch
-  gradient_accumulation_steps: 8  # 梯度累积；有效 batch ≈ bs×accum×n_gpus
-  learning_rate: 0.0001
-  epochs: 1
-  eval_steps: 50             # 每隔多少 step 做验证
-  save_steps: 50             # 每隔多少 step 存 checkpoint
-  logging_steps: 50          # 每隔多少 step 写一次统计表到 run console.log
-  max_seq_length: 1024       # 最大序列长度（token）
-  disable_tqdm: false        # false=终端单行进度条
-
-# —— GRPO（组相对策略优化）——
-grpo:
-  num_generations: 4         # 每 prompt 采样条数（≥2）
-  beta: 0.04                 # KL 惩罚系数
-  max_prompt_length: 1024
-  max_completion_length: 16  # 生成最大长度（letter 答案很短）
-  temperature: 1.0           # 采样温度
-  top_p: 1.0                 # nucleus sampling
-  advantage_normalization: group  # 优势归一化：group 内归一
-  reward_weights:            # 各奖励分量权重（不可全为 0）
-    exact_match: 1.0         # 与标签完全匹配
-    format_validity: 0.2     # 输出格式合法
-    rank_aware: 0.0          # 排序感知奖励
-    semantic_prefix: 0.0     # SID 前缀匹配奖励
-    popularity_penalty: 0.0  # 热门偏置惩罚
-
-# —— 评测 ——
-evaluation:
-  top_k:                     # 报告 HR@k / NDCG@k 等
-    - 1
-    - 5
-    - 10
-  use_upstream_eval: true    # 使用与上游兼容的评测实现
-  max_examples: null         # 评测样本上限；null=全量
-
-# —— 偏见 / 捷径探针（analyze 阶段）——
-bias:
-  probes:
-    - popularity             # 流行度偏置
-    - position               # 候选位置偏置
-    - framing                # 提示表述偏置
-    - recency                # 时效偏置
-
-# —— 日志与追踪 ——
 tracking:
-  console: true              # 终端输出
-  jsonl: true                # 写 JSONL 指标日志
+  console: true
+  jsonl: true
   tensorboard: false
   wandb: false
+
+# 硬件（hardware=single|multi）
+hardware_profiles:
+  single:
+    hardware:
+      name: single
+      cuda_visible_devices: "0"
+      mllm_cuda_visible_devices: "0"
+      env: {}
+    training: {distributed: single, auto_launch_multi_gpu: false}
+  multi:
+    hardware:
+      name: multi
+      cuda_visible_devices: "0,1,2,3"
+      mllm_cuda_visible_devices: "0"
+      env:
+        NCCL_P2P_DISABLE: "1"
+        NCCL_IB_DISABLE: "1"
+        NCCL_NVML_ENABLE: "0"
+        TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+    training: {distributed: auto, auto_launch_multi_gpu: true}
+
+# =============================================================================
+# 路线 1：grpo4rec（Letter 候选选择：SFT → GRPO → eval / probes）
+# =============================================================================
+grpo4rec:
+  workflow:
+    name: grpo4rec
+    task: candidate_choice
+
+  # 路线级默认（各阶段共用）
+  dataset:
+    name: movielens_100k
+    rating_threshold: 4.0
+    split: leave_one_out
+    history_max_length: 20
+    candidate_size: 10
+    negative_sampling: uniform
+    target_position: random
+    framing: neutral
+    min_user_interactions: 5
+    train_limit: null
+    eval_limit: null
+
+  model:
+    name: qwen2.5-0.5b-instruct
+    checkpoint: Qwen/Qwen2.5-0.5B-Instruct
+    dtype: float16
+    use_flash_attention: false
+    gradient_checkpointing: true
+    trust_remote_code: false
+
+  peft:
+    enabled: true
+    method: lora
+    rank: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+  # —— 训练阶段 ——
+  prepare: {}
+
+  sft:
+    training:
+      stages: [sft]
+      batch_size: 4
+      gradient_accumulation_steps: 4
+      learning_rate: 0.0002
+      epochs: 2
+      eval_steps: 100
+      save_steps: 100
+      logging_steps: 10
+      max_seq_length: 1024
+      disable_tqdm: false
+
+  grpo:
+    training:
+      stages: [grpo]
+      batch_size: 1
+      gradient_accumulation_steps: 8
+      learning_rate: 0.00005
+      epochs: 1
+      eval_steps: 50
+      save_steps: 50
+      logging_steps: 5
+      max_seq_length: 1024
+    grpo:
+      num_generations: 8
+      beta: 0.04
+      max_prompt_length: 1024
+      max_completion_length: 64
+      temperature: 1.0
+      top_p: 1.0
+      advantage_normalization: group
+      invalid_penalty: -0.5
+      reward_weights:
+        exact_match: 1.0
+        format_validity: 0.2
+        rank_aware: 0.5
+        semantic_prefix: 0.0
+        popularity_penalty: 0.0
+    reward:
+      name: default
+      components: [exact_match, format_validity]
+      weights: {exact_match: 1.0, format_validity: 0.2}
+
+  evaluate:
+    evaluation:
+      name: ranking
+      top_k: [1, 5, 10]
+      metrics: [hr, recall, ndcg, mrr]
+      use_upstream_eval: true
+      max_examples: null
+
+  analyze:
+    bias:
+      name: default
+      probes: [popularity, position, framing, recency]
+
+  # —— 规模预设（scale=smoke|full 或 experiment=smoke_*）——
+  smoke:
+    dataset:
+      history_max_length: 8
+      train_limit: 64
+      eval_limit: 32
+    peft: {rank: 8, alpha: 16, target_modules: [q_proj, v_proj]}
+    sft:
+      training:
+        batch_size: 1
+        gradient_accumulation_steps: 1
+        learning_rate: 0.0001
+        epochs: 1
+        max_steps: 4
+        eval_steps: 4
+        save_steps: 4
+        logging_steps: 1
+        max_seq_length: 512
+    grpo:
+      training:
+        batch_size: 1
+        prompts_per_step: 1
+        gradient_accumulation_steps: 1
+        max_steps: 4
+        eval_steps: 4
+        save_steps: 4
+        logging_steps: 1
+        max_seq_length: 512
+      grpo:
+        num_generations: 2
+        prompts_per_step: 1
+        max_completion_length: 8
+        max_steps: 4
+        learning_rate: 0.000005
+        reward_weights:
+          exact_match: 1.0
+          format_validity: 0.2
+          rank_aware: 0.0
+          popularity_penalty: 0.0
+    evaluate:
+      evaluation: {max_examples: null}
+    analyze:
+      bias: {max_examples: 16}
+
+  full:
+    dataset: {train_limit: null, eval_limit: null}
+    sft:
+      training: {max_steps: null, epochs: 1, logging_steps: 50, eval_steps: 500, save_steps: 500}
+    grpo:
+      grpo: {max_steps: 100}
+    evaluate:
+      evaluation: {max_examples: null}
+
+# =============================================================================
+# 路线 2：minionerec（Semantic ID：prepare → SFT → GRPO → SID eval）
+# =============================================================================
+minionerec:
+  workflow:
+    name: minionerec
+    task: semantic_id_generation
+    semantic_id:
+      method: residual_kmeans
+      levels: 3
+      codebook_size: 64
+      collision_handling: extra_level
+
+  dataset:
+    name: movielens_100k
+    rating_threshold: 4.0
+    split: leave_one_out
+    history_max_length: 20
+    min_user_interactions: 5
+    train_limit: null
+    eval_limit: null
+
+  model:
+    name: qwen2.5-0.5b-instruct
+    checkpoint: Qwen/Qwen2.5-0.5B-Instruct
+    dtype: float16
+    use_flash_attention: false
+    gradient_checkpointing: true
+
+  peft:
+    enabled: true
+    method: lora
+    rank: 16
+    alpha: 32
+    dropout: 0.05
+
+  prepare:
+    semantic_id:
+      method: residual_kmeans
+      levels: 3
+      codebook_size: 64
+      collision_handling: extra_level
+
+  sft:
+    training:
+      stages: [sft]
+      batch_size: 2
+      gradient_accumulation_steps: 4
+      learning_rate: 0.0001
+      epochs: 1
+      eval_steps: 50
+      save_steps: 50
+      logging_steps: 10
+      max_seq_length: 1024
+
+  grpo:
+    training:
+      stages: [grpo]
+      batch_size: 2
+      gradient_accumulation_steps: 1
+      learning_rate: 0.000005
+      epochs: 1
+      eval_steps: 50
+      save_steps: 50
+      logging_steps: 5
+      max_seq_length: 1024
+    grpo:
+      num_generations: 4
+      beta: 0.04
+      max_completion_length: 16
+      temperature: 0.9
+      prefix_credit: 0.1
+      invalid_penalty: -0.5
+      advantage_normalization: group
+
+  evaluate:
+    evaluation:
+      top_k: [1, 5, 10]
+      max_examples: null
+      free_gen_n: 50
+      use_upstream_eval: true
+
+  analyze: {}
+
+  smoke:
+    dataset:
+      history_max_length: 8
+      train_per_user: 2
+      train_limit: 64
+      eval_limit: 16
+    peft: {rank: 8, alpha: 16}
+    prepare:
+      semantic_id: {codebook_size: 64, levels: 3}
+    sft:
+      training:
+        batch_size: 2
+        gradient_accumulation_steps: 1
+        max_steps: 4
+        eval_steps: 4
+        save_steps: 4
+        logging_steps: 1
+        max_seq_length: 512
+    grpo:
+      training: {max_steps: 4, eval_steps: 4, save_steps: 4, logging_steps: 1, max_seq_length: 512}
+      grpo:
+        num_generations: 2
+        prompts_per_step: 1
+        max_completion_length: 8
+        max_steps: 4
+        learning_rate: 0.000005
+    evaluate:
+      evaluation: {max_examples: 8, free_gen_n: 4}
+
+  full:
+    dataset: {train_limit: null, eval_limit: null}
+    sft:
+      training: {max_steps: null, logging_steps: 50, eval_steps: 500, save_steps: 500}
+    grpo:
+      grpo: {max_steps: 100}
+    evaluate:
+      evaluation: {max_examples: null, free_gen_n: 50}
+
+# =============================================================================
+# 路线 3：mllm4rec（多模态：data → Retriever → Ranker）
+# =============================================================================
+mllm4rec:
+  workflow:
+    name: mllm4rec
+    task: candidate_choice
+    modality: multimodal
+
+  # —— 阶段：数据 ——
+  data:
+    ml100k:
+      dataset:
+        code: ml-100k
+        raw_dir: data/raw/ml-100k
+        output_root: data/preprocessed
+        min_rating: 0
+        min_uc: 5
+        min_sc: 5
+        seed: 42
+      compatibility: {mode: original}
+      filtering: {mode: original, iterative_kcore: true}
+      tmdb:
+        api_key_env: TMDB_API_KEY
+        match_mode: original
+        image_base_url: https://image.tmdb.org/t/p/original
+        timeout_seconds: 30
+        retries: 3
+        max_workers: 8
+        resume: true
+      caption:
+        model_name_or_path: Salesforce/blip2-opt-2.7b
+        device: cuda
+        dtype: float16
+        mode: original
+        batch_size: 1
+        resume: true
+      serialization:
+        save_pickle: true
+        save_parquet: true
+        atomic_write: true
+        create_backup: true
+      logging: {level: INFO, log_dir: logs/mllm4rec}
+
+    ml1m:
+      dataset:
+        code: ml-1m
+        raw_dir: data/raw/ml-1m
+        output_root: data/preprocessed
+        min_rating: 0
+        min_uc: 5
+        min_sc: 5
+        seed: 42
+      compatibility: {mode: original}
+      filtering: {mode: original, iterative_kcore: true}
+      tmdb:
+        api_key_env: TMDB_API_KEY
+        match_mode: original
+        image_base_url: https://image.tmdb.org/t/p/original
+        timeout_seconds: 30
+        retries: 3
+        max_workers: 8
+        resume: true
+      caption:
+        model_name_or_path: Salesforce/blip2-opt-2.7b
+        device: cuda
+        dtype: float16
+        mode: original
+        batch_size: 1
+        resume: true
+      serialization:
+        save_pickle: true
+        save_parquet: true
+        atomic_write: true
+        create_backup: true
+      logging: {level: INFO, log_dir: logs/mllm4rec}
+
+  # —— 阶段：Retriever ——
+  retriever:
+    dataset:
+      dataset_pkl: data/preprocessed/ml-100k_min_rating0-min_uc5-min_sc5/dataset.pkl
+    retriever:
+      export_root: experiments/lru/ml-100k
+      device: cuda
+      seed: 42
+      bert_max_len: 200
+      bert_hidden_units: 64
+      bert_num_blocks: 2
+      train_batch_size: 16
+      val_batch_size: 16
+      test_batch_size: 16
+      num_epochs: 500
+      val_strategy: iteration
+      val_iterations: 500
+      early_stopping_patience: 20
+      lr: 0.001
+      weight_decay: 0.01
+      bert_dropout: 0.2
+      bert_attn_dropout: 0.2
+
+  # —— 阶段：Ranker ——
+  ranker:
+    ranker:
+      dataset_pkl: data/preprocessed/ml-100k_min_rating0-min_uc5-min_sc5/dataset.pkl
+      retrieved_pkl: experiments/lru/ml-100k/retrieved.pkl
+      export_root: experiments/ranker/ml-100k
+      llm_base_model: Qwen/Qwen2.5-0.5B-Instruct
+      llm_base_tokenizer: Qwen/Qwen2.5-0.5B-Instruct
+      device: cuda
+      dtype: float16
+      load_in_4bit: false
+      lora_num_epochs: 3
+      lora_micro_batch_size: 2
+      lora_lr: 0.0001
+      llm_negative_sample_size: 19
+      llm_max_history: 25
+
+  smoke:
+    retriever:
+      retriever: {num_epochs: 2}
+    ranker:
+      ranker: {lora_num_epochs: 1, max_train_steps: 20}
+
+  full: {}
+
+# 可选全局预设（reward=… / evaluation=…）
+reward_presets:
+  default:
+    reward:
+      name: default
+      components: [exact_match, format_validity]
+      weights: {exact_match: 1.0, format_validity: 0.2}
+  accuracy:
+    reward:
+      name: accuracy
+      components: [exact_match, format_validity]
+      weights: {exact_match: 1.0, format_validity: 0.2}
+  bias_aware:
+    reward:
+      name: bias_aware
+      components: [ndcg, popularity_penalty, position_penalty]
+      weights: {ndcg: 1.0, popularity_penalty: 0.2, position_penalty: 0.1}
+      invalid_penalty: -0.5
+
+evaluation_presets:
+  ranking:
+    evaluation:
+      name: ranking
+      top_k: [1, 5, 10]
+      metrics: [hr, recall, ndcg, mrr]
+  full_bias:
+    evaluation:
+      name: full_bias
+      top_k: [1, 5, 10]
+      metrics: [hr, recall, ndcg, mrr]
+      bias: [popularity_bias, position_bias, framing_bias, history_bias]
+      generation: [sid_validity, semantic_collision, generation_accuracy]
+
+# =============================================================================
+# 实验名 → 路线 + 规模 + 阶段（兼容 experiment=smoke_grpo 等旧写法）
+# =============================================================================
+experiments:
+  smoke_grpo:
+    workflow: grpo4rec
+    scale: smoke
+    stages: [sft, grpo, evaluate, analyze]
+  smoke_sft:
+    workflow: grpo4rec
+    scale: smoke
+    stages: [sft, evaluate]
+  smoke_test:
+    workflow: grpo4rec
+    scale: smoke
+    stages: [sft, grpo, evaluate, analyze, report]
+    # prepare 用稍大样本
+    overrides:
+      dataset: {train_limit: 1000, eval_limit: 200, history_max_length: 20}
+  smoke_sid:
+    workflow: minionerec
+    scale: smoke
+    stages: [sft, grpo, evaluate, analyze]
+  smoke_probes:
+    workflow: grpo4rec
+    scale: smoke
+    stages: [analyze]
+  ablation_reward:
+    workflow: grpo4rec
+    scale: full
+    stages: [grpo, evaluate, analyze, report]
+    overrides:
+      grpo:
+        grpo:
+          reward_weights:
+            exact_match: 1.0
+            format_validity: 0.2
+            rank_aware: 0.5
+            popularity_penalty: 0.5

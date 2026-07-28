@@ -16,9 +16,10 @@ def register_workflow(name: str) -> Callable[[type], type]:
 
 
 def get_workflow_class(name: str) -> type:
-    from llm4rec.workflows import grpo4rec as _g  # noqa: F401
-    from llm4rec.workflows import minionerec as _m  # noqa: F401
-    from llm4rec.workflows import mllm4rec as _l  # noqa: F401
+    # Import pipeline modules (not just packages) so @register_workflow runs.
+    from llm4rec.workflows.grpo4rec import pipeline as _g  # noqa: F401
+    from llm4rec.workflows.minionerec import pipeline as _m  # noqa: F401
+    from llm4rec.workflows.mllm4rec import pipeline as _l  # noqa: F401
 
     return WORKFLOW_REGISTRY.get(name)
 

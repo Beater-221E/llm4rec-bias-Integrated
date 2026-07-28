@@ -1,7 +1,0 @@
-bias:
-  name: semantic_prefix
-  probes:
-    - semantic_prefix
-  semantic_prefix:
-    track_exact_vs_prefix: true
-    track_per_level_accuracy: true

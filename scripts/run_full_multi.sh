@@ -124,11 +124,11 @@ run_step sid_prepare python -m llm4rec_bias_Integrated.cli.main prepare experime
 run_step sid_train   python -m llm4rec_bias_Integrated.cli.main train experiment=smoke_sid
 
 run_step mllm_build env CUDA_VISIBLE_DEVICES=0 python -m llm4rec_bias_Integrated.data.mllm4rec.cli build \
-  --config configs/dataset/mllm4rec_ml100k.yaml
+  --config mllm4rec_ml100k
 run_step mllm_retriever env CUDA_VISIBLE_DEVICES=0 python -m llm4rec_bias_Integrated.mllm4rec.cli train-retriever \
-  --config configs/training/mllm4rec_retriever.yaml
+  --config mllm4rec_retriever
 run_step mllm_ranker env CUDA_VISIBLE_DEVICES=0 python -m llm4rec_bias_Integrated.mllm4rec.cli train-ranker \
-  --config configs/training/mllm4rec_ranker.yaml \
+  --config mllm4rec_ranker \
   --retrieved-pkl experiments/lru/ml-100k/retrieved.pkl
 
 echo "DONE full_multi $(date -Is)" | tee -a "$STATUS"

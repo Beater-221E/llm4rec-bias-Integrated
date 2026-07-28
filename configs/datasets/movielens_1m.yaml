@@ -1,9 +1,0 @@
-dataset:
-  name: movielens_1m
-  source: grouplens
-  rating_threshold: 4.0
-  split: leave_one_out
-  history_max_length: 20
-  candidate_size: 10
-  negative_sampling: uniform
-  min_user_interactions: 5

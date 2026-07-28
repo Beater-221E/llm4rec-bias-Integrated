@@ -11,8 +11,6 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
-import yaml
-
 from llm4rec.workflows.mllm4rec.data.constants import (
     DEFAULT_BLIP2_MODEL,
     DEFAULT_MIN_RATING,
@@ -102,11 +100,15 @@ def load_data_config(
     *,
     overrides: dict[str, Any] | None = None,
 ) -> MLLM4RecDataConfig:
-    """Load YAML config and apply flat overrides (CLI)."""
+    """Load YAML / config.yaml profile and apply flat overrides (CLI)."""
+    from llm4rec.core.profile_io import load_yaml_or_profile
+
     raw: dict[str, Any] = {}
     if path is not None:
-        with Path(path).open(encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
+        raw = load_yaml_or_profile(
+            path,
+            default_slots=("mllm_dataset", "dataset", "training"),
+        )
 
     ds = raw.get("dataset") or {}
     compat = raw.get("compatibility") or {}
