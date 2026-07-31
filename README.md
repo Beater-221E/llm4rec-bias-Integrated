@@ -73,6 +73,7 @@ python -m llm4rec_bias_Integrated.data.mllm4rec.cli build --config mllm4rec_ml10
 ./grpo4rec.sh             # 单卡：HARDWARE=single ./grpo4rec.sh
 ./minionerec.sh
 ./mllm4rec.sh             # 无完整 pkl+caption 时需要 TMDB_API_KEY
+./evaluation.sh           # SID 独立评估（先填 RUN_DIRS；默认 SFT）
 ```
 
 ## 配置怎么读
@@ -93,6 +94,69 @@ python -m llm4rec_bias_Integrated.mllm4rec.cli train-retriever --config mllm4rec
 python -m llm4rec_bias_Integrated.mllm4rec.cli train-ranker --config mllm4rec_ranker \
   --retrieved-pkl experiments/lru/ml-100k/retrieved.pkl
 ```
+
+## 评估
+
+训练结束后，指标会写在对应 `run_dir` 的 `eval/` 下。也可事后单独重评。
+
+### 训练时自动写出（推荐先看这里）
+
+| 路线 | 何时算 | 产物 |
+|------|--------|------|
+| **minionerec（SID）** | SFT / GRPO 阶段结束后 | `eval/sft_metrics.json`、`eval/grpo_metrics.json` |
+| **grpo4rec（Letter）** | 同上 | 同上（HR/NDCG/MRR/`pop_lift` 等） |
+
+minionerec 的 SID 指标还包括 bias / 多样性：`pop_lift@1`、`delta_gap`、`exposure_gini`、`coverage@K`、`hr_ips@K`、`ndcg_ips@K`、`hr@K_{head,mid,tail}`、`free_gen_valid_rate`。
+
+`stages` 里的 `evaluate` **不会再算一遍**，只是把已有 `eval_sft` / `eval_grpo` 挂到 `summary.json`。  
+train 里的 `analyze` 写的是 `eval/reward_hacking.json`（reward vs held-out），不是 letter 探针。
+
+### minionerec：独立重评（`evaluation.sh`）
+
+```bash
+# 1. 编辑 evaluation.sh，填入 run 目录（CHECKPOINTS 可留空）
+RUN_DIRS=(
+  "runs/movielens_100k/minionerec/<exp>/seed_42/<timestamp>"
+)
+
+# 2. 默认评 SFT → eval/sft_metrics.json
+./evaluation.sh
+
+# 评 GRPO
+CHECKPOINT_STAGE=grpo ./evaluation.sh
+```
+
+等价 CLI：
+
+```bash
+export PYTHONPATH=src
+python -m llm4rec.cli.main evaluate \
+  run_dir=runs/.../20... \
+  experiment=smoke_sid \
+  checkpoint_stage=sft
+```
+
+前提：`data/processed/<dataset>/sid/` 已存在（`prepare experiment=smoke_sid` 或训练时已建）。
+
+> `smoke_sid` 只是 **冒烟实验名**（少量数据、几步训练），不是正式全量评测预设。正式结果请指向真实 `run_dir`。
+
+### grpo4rec：Letter 重评与偏置探针
+
+```bash
+python -m llm4rec.cli.main evaluate run_dir=$RUN_DIR
+# 仅 CPU 重聚合已有 predictions
+python -m llm4rec.cli.main evaluate run_dir=$RUN_DIR evaluation.predictions_only=true
+
+# popularity / position / framing / recency 探针（需 GPU + checkpoint）
+python -m llm4rec.cli.main analyze run_dir=$RUN_DIR
+python -m llm4rec.cli.main analyze run_dir=$RUN_DIR checkpoint_stage=grpo
+```
+
+探针结果在 `eval/probes/`。这套探针面向 **letter** 路线；SID 的 bias 以 `*_metrics.json` 里字段为主。
+
+### 更新说明
+
+见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 测试 / 清理
 
