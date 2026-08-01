@@ -13,7 +13,30 @@ export PYTHONPATH=src
 python -m llm4rec.cli.main validate experiment=smoke_test
 ```
 
-## 数据集怎么建
+### Rivanna（UVA HPC）
+
+Login 节点交互式用 `conda activate bias` 即可。`bias` 环境在 **`~/.conda/envs/bias`**（conda base 在 `~/senet.pytorch/ENTER`）。
+
+**sbatch / 计算节点**上没有 `/opt/miniconda3`，不要硬编码 `source /opt/miniconda3/...`；在脚本里直接加 PATH：
+
+```bash
+export PATH="$HOME/.conda/envs/bias/bin:$PATH"
+export PYTHONPATH=src
+```
+
+大输出目录（`runs/`、`logs/`、HuggingFace 缓存等）建议迁到 scratch 并 symlink 回 repo：
+
+```bash
+bash scripts/rivanna_scratch_setup.sh   # 默认 /scratch/$USER/llm4rec-bias-Integrated
+```
+
+GPU 批任务示例（grpo4rec full SFT）：
+
+```bash
+sbatch scripts/grpo4rec_sft_full.sbatch
+tail -f logs/grpo4rec_sft_full_<JOBID>.out
+```
+
 
 三条路线**不共用同一份预处理结果**，先建好再训。
 

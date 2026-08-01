@@ -12,34 +12,37 @@ if [[ "${_LLM4REC_LOG_READY:-0}" != "1" ]]; then
 fi
 
 # Progress / status → real terminal only.
-# Prefer a concrete /dev/pts/N path: accelerate/elastic workers often have no
-# controlling TTY, so opening "/dev/tty" fails even when the parent shell has one.
-_TTY="/dev/tty"
+# sbatch / no controlling TTY: fall back to stderr (never open /dev/tty).
+_TTY="/dev/stderr"
 _PROGRESS_FD=""
-_TTY_PATH=""
-if [[ -c "$_TTY" && -w "$_TTY" ]]; then
-  exec 3>"$_TTY"
-  _PROGRESS_FD=3
-  # Resolve real pts. readlink(/proc/.../fd/3) often stays "/dev/tty"; ttyname() does not.
-  _TTY_PATH=""
-  if command -v python >/dev/null 2>&1; then
-    _TTY_PATH="$(python -c 'import os; print(os.ttyname(3))' 2>/dev/null || true)"
-  fi
-  if [[ -z "$_TTY_PATH" || "$_TTY_PATH" == "/dev/tty" || ! -c "$_TTY_PATH" ]]; then
-    _TTY_PATH="$(tty 2>/dev/null || true)"
-  fi
-  if [[ -z "$_TTY_PATH" || "$_TTY_PATH" == "not a tty" || "$_TTY_PATH" == "/dev/tty" || ! -c "$_TTY_PATH" ]]; then
-    _cand="$(readlink "/proc/$$/fd/3" 2>/dev/null || true)"
-    if [[ -n "$_cand" && "$_cand" != "/dev/tty" && -c "$_cand" ]]; then
-      _TTY_PATH="$_cand"
-    else
-      _TTY_PATH="$_TTY"
+_TTY_PATH="$_TTY"
+if [[ -z "${SLURM_JOB_ID:-}" ]] && [[ -t 1 ]] && [[ -c /dev/tty ]]; then
+  # exec may fail on some nodes even when -c/-w look OK; must not abort under set -e.
+  if exec 3>/dev/tty 2>/dev/null; then
+    _TTY="/dev/tty"
+    _PROGRESS_FD=3
+    _TTY_PATH=""
+    if command -v python >/dev/null 2>&1; then
+      _TTY_PATH="$(python -c 'import os; print(os.ttyname(3))' 2>/dev/null || true)"
     fi
+    if [[ -z "$_TTY_PATH" || "$_TTY_PATH" == "/dev/tty" || ! -c "$_TTY_PATH" ]]; then
+      _TTY_PATH="$(tty 2>/dev/null || true)"
+    fi
+    if [[ -z "$_TTY_PATH" || "$_TTY_PATH" == "not a tty" || "$_TTY_PATH" == "/dev/tty" || ! -c "$_TTY_PATH" ]]; then
+      _cand="$(readlink "/proc/$$/fd/3" 2>/dev/null || true)"
+      if [[ -n "$_cand" && "$_cand" != "/dev/tty" && -c "$_cand" ]]; then
+        _TTY_PATH="$_cand"
+      else
+        _TTY_PATH="$_TTY"
+      fi
+    fi
+    unset _cand || true
+  else
+    exec 3>&2
+    _PROGRESS_FD=""
+    _TTY="/dev/stderr"
+    _TTY_PATH="$_TTY"
   fi
-  unset _cand || true
-else
-  _TTY="/dev/stderr"
-  _TTY_PATH="$_TTY"
 fi
 
 tty_status() {
@@ -89,6 +92,10 @@ step() {
 }
 
 activate_bias() {
+  if [[ -x "$HOME/.conda/envs/bias/bin/python" ]]; then
+    export PATH="$HOME/.conda/envs/bias/bin:$PATH"
+    return 0
+  fi
   if [[ -f /opt/miniconda3/etc/profile.d/conda.sh ]]; then
     # shellcheck disable=SC1091
     source /opt/miniconda3/etc/profile.d/conda.sh
