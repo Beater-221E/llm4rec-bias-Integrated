@@ -227,6 +227,23 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 0 if report["ok"] else 1
 
 
+def _stub_text_only_captions(cfg: MLLM4RecDataConfig) -> None:
+    """Text-only builds need empty meta_img_des so ranker training can run without BLIP2."""
+    path = cfg.dataset_pkl_path
+    if not path.is_file():
+        return
+    dataset = load_pickle(path)
+    meta = dataset.get("meta") or {}
+    dataset["meta_img_des"] = {int(k): "" for k in meta}
+    save_pickle(
+        dataset,
+        path,
+        atomic_write=cfg.atomic_write,
+        create_backup=cfg.create_backup,
+    )
+    logger.info("Stubbed meta_img_des (%s keys) for text-only mode", len(meta))
+
+
 def cmd_build(args: argparse.Namespace) -> int:
     """Full multimodal data build (preprocess → TMDb → posters → captions → validate)."""
     skip_mm = bool(getattr(args, "skip_multimodal", False))
@@ -234,6 +251,8 @@ def cmd_build(args: argparse.Namespace) -> int:
         return 1
     if cmd_preprocess(args) != 0:
         return 1
+    if skip_mm:
+        _stub_text_only_captions(_config_from_args(args))
     if not skip_mm:
         if cmd_match_tmdb(args) != 0:
             return 1

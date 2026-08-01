@@ -227,7 +227,12 @@ def load_ranker_bundle(
     metric_ks = metric_ks or [1, 5, 10, 20, 50]
     dataset = load_pickle(dataset_pkl)
     if "meta_img_des" not in dataset:
-        raise KeyError("dataset.pkl missing meta_img_des — run generate-captions first")
+        meta = dataset.get("meta") or {}
+        dataset["meta_img_des"] = {int(k): "" for k in meta}
+        logger.warning(
+            "dataset.pkl missing meta_img_des — stubbed %s empty captions for text-only mode",
+            len(meta),
+        )
     retrieved = pickle.load(open(retrieved_pkl, "rb"))
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
