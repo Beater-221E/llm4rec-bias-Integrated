@@ -27,13 +27,13 @@ log "minionerec full start → $LOG"
 log "Python=$(command -v python)  COMPOSE=$LLM4REC_COMPOSE  CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 tty_endl "minionerec → $LOG"
 
-step validate python -m llm4rec_bias_Integrated.cli.main validate experiment=smoke_sid
-step prepare  python -m llm4rec_bias_Integrated.cli.main prepare experiment=smoke_sid
-step train    python -m llm4rec_bias_Integrated.cli.main train experiment=smoke_sid
+step validate python -m llm4rec.cli.main validate experiment=smoke_sid
+step prepare  python -m llm4rec.cli.main prepare experiment=smoke_sid
+step train    python -m llm4rec.cli.main train experiment=smoke_sid
 
 RUN_DIR="$(ls -dt runs/movielens_100k/minionerec/*/seed_*/20* 2>/dev/null | head -1 || true)"
 if [[ -n "${RUN_DIR:-}" && -d "$RUN_DIR" ]]; then
-  step evaluate python -m llm4rec_bias_Integrated.cli.main evaluate "run_dir=${RUN_DIR}"
+  step evaluate python -m llm4rec.cli.main evaluate "run_dir=${RUN_DIR}"
   log "run_dir=$RUN_DIR"
 else
   log "WARN: no run_dir found for post-eval"
