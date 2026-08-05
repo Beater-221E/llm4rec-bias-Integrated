@@ -1,7 +1,6 @@
-# Byte-compiled / cache
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
 *.egg-info/
 .eggs/
 dist/
@@ -10,58 +9,43 @@ build/
 .ruff_cache/
 .mypy_cache/
 .coverage
-htmlcov/
 
-# Virtual envs
+# 虚拟环境
 .venv/
 venv/
 .env
 .env.*
 
-# IDE
-.idea/
-.vscode/
-*.swp
-
-# Data & runs (keep directory placeholders via .gitkeep)
-data/raw/*
-!data/raw/.gitkeep
-data/processed/*
-!data/processed/.gitkeep
-data/preprocessed/*
-!data/preprocessed/.gitkeep
-data/cache/*
-!data/cache/.gitkeep
-logs/mllm4rec/*
-!logs/mllm4rec/.gitkeep
-runs/*
-!runs/.gitkeep
-experiments/*
-!experiments/.gitkeep
-reports/*
-!reports/.gitkeep
-
-
-
-# OS
+# OS / 编辑器
 .DS_Store
-
-# Logs / notebooks checkpoints
-*.log
 .ipynb_checkpoints/
 
-# Model / pickle artifacts
-*.pkl
+# —— 数据与产物（都很大，不进 git）——
+data/raw/**
+!data/raw/.gitkeep
+data/processed/**
+!data/processed/.gitkeep
+data/models/**
+!data/models/.gitkeep
+
+# artifacts/ 里的 SID 产物值得单独打包分发（见 README「SID 导入」），
+# 但不适合进 git —— codebook.pt 几十 MB
+artifacts/**
+!artifacts/.gitkeep
+
+# 训练输出
+runs/**
+!runs/.gitkeep
+logs/**
+!logs/.gitkeep
+
+# wandb 本地缓存
+wandb/
+
+# 模型权重
 *.pt
 *.bin
 *.ckpt
 *.safetensors
-
-# Broader logs (retain mllm4rec .gitkeep rules above)
-logs/*
-!logs/**/.gitkeep
-
-# Checkpoints
-checkpoints/
-**/checkpoints/
-
+*.npy
+*.pkl

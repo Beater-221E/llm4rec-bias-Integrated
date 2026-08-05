@@ -1,1 +1,0 @@
-"""Prompt template JSON assets."""

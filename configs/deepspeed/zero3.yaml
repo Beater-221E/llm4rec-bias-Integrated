@@ -1,0 +1,42 @@
+# =============================================================================
+# ZeRO-3 —— 连模型参数一起切分。7B+ 全参微调才需要。
+#
+# ★ 只作用于 SFT。RL/DPO 阶段本框架走 DDP，因为 ZeRO-3 下每次 generate 都要
+#   gather 全部参数，而 GRPO 每 step 要采 group_size 条，会慢到不可用。
+#   用 zero3 之前先确认：RL 阶段单卡放得下这个模型。
+# =============================================================================
+
+deepspeed_config:
+  bf16: {enabled: auto}
+  fp16:
+    enabled: auto
+    loss_scale: 0
+    initial_scale_power: 16
+    loss_scale_window: 1000
+    hysteresis: 2
+    min_loss_scale: 1
+
+  optimizer:
+    type: AdamW
+    params: {lr: auto, betas: auto, eps: auto, weight_decay: auto}
+
+  zero_optimization:
+    stage: 3
+    overlap_comm: true
+    contiguous_gradients: true
+    sub_group_size: 1000000000
+    reduce_bucket_size: auto
+    stage3_prefetch_bucket_size: auto
+    stage3_param_persistence_threshold: auto
+    stage3_max_live_parameters: 1000000000
+    stage3_max_reuse_distance: 1000000000
+    # 存盘时把切分的 fp16 参数聚回来，否则 checkpoint 是残缺的
+    stage3_gather_16bit_weights_on_model_save: true
+    offload_optimizer: {device: none}
+    offload_param: {device: none}
+
+  gradient_accumulation_steps: auto
+  gradient_clipping: auto
+  train_batch_size: auto
+  train_micro_batch_size_per_gpu: auto
+  wall_clock_breakdown: false

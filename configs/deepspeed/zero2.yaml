@@ -1,0 +1,51 @@
+# =============================================================================
+# DeepSpeed ZeRO-2 —— 切分 optimizer state + 梯度，参数不切。
+# 0.5B~3B 全参微调的默认选择。对齐官方 MiniOneRec 的 config/zero2_opt.yaml。
+#
+# 用法：hardware.deepspeed: zero2   （或 DEEPSPEED=zero2 bash run.sh）
+# "auto" 的字段由 HF Trainer 按 TrainingArguments 自动填，不用手算。
+# =============================================================================
+
+deepspeed_config:
+  bf16:
+    enabled: auto
+  fp16:
+    enabled: auto
+    loss_scale: 0
+    initial_scale_power: 16
+    loss_scale_window: 1000
+    hysteresis: 2
+    min_loss_scale: 1
+
+  optimizer:
+    type: AdamW
+    params:
+      lr: auto
+      betas: auto
+      eps: auto
+      weight_decay: auto
+
+  scheduler:
+    type: WarmupDecayLR
+    params:
+      warmup_min_lr: auto
+      warmup_max_lr: auto
+      warmup_num_steps: auto
+      total_num_steps: auto
+
+  zero_optimization:
+    stage: 2
+    allgather_partitions: true
+    allgather_bucket_size: 500000000
+    overlap_comm: true
+    reduce_scatter: true
+    reduce_bucket_size: 500000000
+    contiguous_gradients: true
+    offload_optimizer:
+      device: none
+
+  gradient_accumulation_steps: auto
+  gradient_clipping: auto
+  train_batch_size: auto
+  train_micro_batch_size_per_gpu: auto
+  wall_clock_breakdown: false

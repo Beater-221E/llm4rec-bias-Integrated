@@ -1,0 +1,74 @@
+# =============================================================================
+# 全局默认 — 所有实验都会先加载这一层，再被 data/model/sid/bias/exp 逐层覆盖
+# =============================================================================
+
+seed: 42
+
+paths:
+  data_root: data
+  raw_dir: data/raw
+  processed_dir: data/processed
+  artifacts_dir: artifacts     # 静态产物（SID 码本等），训练只读
+  runs_dir: runs               # 每次训练的输出
+  cache_dir: data/cache
+
+hardware:
+  # run.sh 的 GPUS 会覆盖这里
+  devices: "0"
+  # V100 没有 bf16，且 mor-reproduce 实测 fp16 下 SID SFT（新增 embedding）会发散，
+  # 所以默认 fp32。A100/H100 上把这里改成 bf16。
+  precision: fp32
+  gradient_checkpointing: true
+
+  # —— 多卡策略 ——
+  #   SFT  : 走 HF Trainer，可用 DeepSpeed ZeRO（deepspeed 字段）
+  #   RL/DPO: 手写训练循环，走 DDP（自己 all-reduce 梯度、按 rank 分样本）
+  #
+  # deepspeed: null | zero2 | zero2_offload | zero3
+  #   → 对应 configs/deepspeed/<name>.json
+  #   null  = SFT 也用 DDP（0.5B 单卡放得下，DDP 更快、更少坑）
+  #   zero2 = 官方 MiniOneRec 的设定（config/zero2_opt.yaml），3B+ 建议开
+  #   zero3 = 7B+ 才需要；★ RL 阶段不要用 zero3，generate 每步都要 gather 参数，会极慢
+  deepspeed: null
+  env:
+    NCCL_P2P_DISABLE: "1"
+    NCCL_IB_DISABLE: "1"
+    NCCL_NVML_ENABLE: "0"
+    TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+    TOKENIZERS_PARALLELISM: "false"
+
+# —— 实验跟踪 ——
+# 一个 run 贯穿 SFT + RL，用 stage 字段区分阶段，
+# 这样 loss / reward 曲线上能一眼看出 RL 从哪一步接上。
+wandb:
+  enabled: true
+  project: llm4rec-bias
+  entity: null                 # 你的 wandb team；null = 个人默认
+  group: null                  # null → 自动填 experiment.name
+  job_type: null               # null → 自动填当前 stage
+  tags: []
+  mode: online                 # online | offline | disabled
+  # 每隔多少 optimizer step 推一次标量
+  log_interval: 1
+  # 训练结束后把 run_dir 下的 metrics json 作为 artifact 上传
+  log_artifacts: false
+
+tracking:
+  console: true
+  jsonl: true                  # run_dir/metrics.jsonl，wandb 挂了也不丢数据
+  tensorboard: false
+
+# —— 评测（三条路线共用，全部在 ranked item list 上算）——
+evaluation:
+  top_k: [1, 5, 10, 20]
+  metrics: [hr, ndcg, mrr]
+  max_examples: null           # null = 全量 test
+  batch_size: 8
+
+# —— checkpoint 策略 ——
+# 目标：训练中在线评 bias，不靠密集存 checkpoint 换空间。
+checkpoint:
+  save_stage_final: true       # 每个 stage 结束存一份（SFT 完 / RL 完）
+  save_steps: null             # null = 训练中不存中间 checkpoint
+  save_total_limit: 1
+  save_optimizer_state: false  # 全参 0.5B 的 optimizer state 也有 ~2GB，默认不存

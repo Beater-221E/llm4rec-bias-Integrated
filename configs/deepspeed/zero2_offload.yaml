@@ -1,0 +1,34 @@
+# =============================================================================
+# ZeRO-2 + optimizer state 卸载到 CPU。
+# 显存不够时用（例：V100-32G 跑 3B 全参）。代价：慢 20~40%，且吃内存。
+# =============================================================================
+
+deepspeed_config:
+  bf16: {enabled: auto}
+  fp16:
+    enabled: auto
+    loss_scale: 0
+    initial_scale_power: 16
+    loss_scale_window: 1000
+    hysteresis: 2
+    min_loss_scale: 1
+
+  optimizer:
+    type: AdamW
+    params: {lr: auto, betas: auto, eps: auto, weight_decay: auto}
+
+  zero_optimization:
+    stage: 2
+    allgather_partitions: true
+    overlap_comm: true
+    reduce_scatter: true
+    contiguous_gradients: true
+    offload_optimizer:
+      device: cpu
+      pin_memory: true
+
+  gradient_accumulation_steps: auto
+  gradient_clipping: auto
+  train_batch_size: auto
+  train_micro_batch_size_per_gpu: auto
+  wall_clock_breakdown: false

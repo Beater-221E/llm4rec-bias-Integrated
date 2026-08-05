@@ -1,0 +1,117 @@
+# =============================================================================
+# Rec-R1 × Qwen2.5-0.5B-Instruct × Amazon Reviews 2023
+#   LLM 生成检索 query → BM25 → ranked list；reward = 检索 NDCG + 格式分
+#
+#     bash prepare.sh EXP=recr1_qwen05b_amazon    # 下载 → 预处理 → BM25 索引
+#     EXP=recr1_qwen05b_amazon bash run.sh
+#
+# ★ 原文（linjc16/Rec-R1）没有 SFT，直接 RL；也确实是 GRPO 不是 PPO
+#   （verl 入口叫 main_ppo.py，但脚本里 algorithm.adv_estimator=grpo）。
+#   我们统一加了 SFT 作为共同基线；要严格复现原文就把 stages 改成 [eval, rl, eval]。
+# =============================================================================
+
+defaults:
+  - base
+  - data/amazon23
+  - model/qwen2.5-0.5b-instruct
+  - bias/default
+
+experiment: {name: recr1_qwen05b_amazon, route: recr1}
+seed: 42
+stages: [sft, eval, rl, eval]
+
+data:
+  category: Industrial_and_Scientific
+  history_max_length: 10        # query 生成不需要太长历史
+  max_train_samples: -1
+  max_eval_samples: -1
+
+hardware:
+  devices: "0,1,2,3"
+  precision: fp32
+  gradient_checkpointing: true
+  deepspeed: null
+
+decoder:
+  name: bm25_query
+  response_format: think_answer_json   # <think>..</think><answer>{"query":".."}</answer>
+  answer_key: query
+  max_new_tokens: 512
+  retriever:
+    kind: bm25                  # 纯 Python；换 lucene 可对齐原文的 pyserini
+    fields: [title, description, categories, brand]
+    k1: 0.9
+    b: 0.4
+    index_dir: artifacts/bm25
+    train_top_k: 1000           # 原文训练用 NDCG@1000
+    eval_top_k: 100             # 原文验证/测试用 NDCG@100
+
+train:
+  sft:                          # 格式预热：教模型输出合法的 think/answer 结构
+    tasks: [query_gen]
+    epochs: 1
+    max_steps: null
+    learning_rate: 1.0e-5
+    lr_scheduler_type: cosine
+    warmup_ratio: 0.03
+    weight_decay: 0.0
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    max_grad_norm: 1.0
+    per_device_batch_size: 2
+    gradient_accumulation_steps: 8
+    max_seq_length: 1024
+    logging_steps: 10
+    eval_steps: 200
+    load_best_model_at_end: false
+
+  rl:
+    algorithm: grpo             # 原文 algorithm.adv_estimator=grpo
+    epochs: 50                  # 原文 trainer.total_epochs=50
+    max_steps: 1000             # 实际按 step 收敛；想跑满 epoch 改成 null
+
+    eval_steps: 10              # 原文 trainer.test_freq=10
+    bias_eval_steps: 10
+    eval_examples: 256
+    logging_steps: 1
+
+    learning_rate: 1.0e-6       # 原文 actor.optim.lr=1e-6
+    lr_scheduler_type: constant
+    warmup_ratio: 0.0
+    weight_decay: 0.0
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    max_grad_norm: 1.0
+
+    rollout_batch_size: 32      # 原文 data.train_batch_size=32
+    per_device_batch_size: 2    # 原文 ppo_micro_batch_size=2
+    gradient_accumulation_steps: 8
+    max_prompt_length: 256      # 原文 data.max_prompt_length=256
+    max_response_length: 512    # 原文 data.max_response_length=512
+
+    grpo:
+      group_size: 12            # 原文 rollout.n=12
+      temperature: 0.6          # 原文 rollout.temperature=0.6
+      top_p: 0.95               # 原文 rollout.top_p=0.95
+      beta: 0.001               # 原文 kl_loss_coef / kl_ctrl.kl_coef=0.001
+      kl_loss_type: low_var_kl  # 原文 kl_loss_type=low_var_kl
+      use_kl_loss: true
+      clip_epsilon: 0.2
+      advantage_normalization: group
+
+    reward:                     # 原文 verl/utils/reward_score/amazon_c4.py
+      metric: ndcg
+      format_reward: 0.1
+      format_penalty: -2.0
+      retrieval_error_score: -2.0
+
+bias: {online_stages: [rl], top_k: 10, final_examples: null, ips_gamma: 1.0}
+checkpoint: {save_stage_final: true, save_steps: null, save_total_limit: 1}
+wandb:
+  enabled: true
+  project: llm4rec-bias
+  group: recr1_qwen05b_amazon
+  tags: [recr1, qwen0.5b, amazon23, bm25]
+  mode: online

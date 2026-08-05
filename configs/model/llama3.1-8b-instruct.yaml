@@ -1,0 +1,19 @@
+# =============================================================================
+# Backbone: meta-llama/Meta-Llama-3.1-8B-Instruct
+# DPO4Rec 原文的 backbone
+#
+# 换 backbone 只改 exp 配置 defaults 里的这一行，或命令行：
+#   bash run.sh model.checkpoint=meta-llama/Meta-Llama-3.1-8B-Instruct
+# 代码零改动 —— 加载走通用的 AutoModelForCausalLM。
+# =============================================================================
+
+model:
+  name: llama3.1-8b-instruct
+  checkpoint: meta-llama/Meta-Llama-3.1-8B-Instruct
+  local_path: data/models/Meta-Llama-3.1-8B-Instruct
+  dtype: ${hardware.precision}
+  gradient_checkpointing: ${hardware.gradient_checkpointing}
+  trust_remote_code: false
+  use_flash_attention: false
+  full_finetuning: true
+  freeze_llm: false

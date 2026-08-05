@@ -1,0 +1,58 @@
+# =============================================================================
+# Bias 评测 — 三条路线共用。
+#
+# 关键设计：所有 bias 指标都算在【最终的 ranked item list】上，不看 LLM 的原始输出。
+# 三条路线 LLM 吐的东西完全不同（SID token / 检索 query / 推理文本），
+# 只有 ranked list 这一层是可比的。
+#
+# 研究假设：RL 会放大 bias。所以 SFT 阶段只在结束时评一次（拿基线），
+# RL 阶段【训练中在线评】，这样能看到 bias 随 RL step 的漂移曲线，
+# 而且不用为了事后评测密集保存 checkpoint。
+# =============================================================================
+
+bias:
+  # 在哪些 stage 评。sft 不在列表里 = SFT 训练中不评（只在 stage 结束评一次基线）。
+  online_stages: [rl, dpo]
+  # ★ 在线评测频率不在这里配，在 train.<stage>.bias_eval_steps 里配
+  #   （留 null 就跟随 train.<stage>.eval_steps）。
+  #   原因：RL 是按 step 跑的，评测频率是 per-stage 的训练参数，
+  #   放在 bias 这个跨 stage 共享的层里会互相打架。
+  #   下面这个只是兜底默认值。
+  every_n_steps: 50
+  # 在线评测用的固定 held-out 子集大小（固定 seed 采样，跨 step 可比）；
+  # train.<stage>.eval_examples 会覆盖它
+  online_examples: 256
+  # stage 结束时的完整评测样本数（null = 全量）
+  final_examples: null
+  top_k: 10
+
+  # —— 流行度 tier 划分（按物品交互次数的分位）——
+  tiers:
+    head: 0.8      # 分位 >= 0.8 为 head
+    tail: 0.2      # 分位 <= 0.2 为 tail；中间为 mid
+
+  metrics:
+    # 流行度偏置
+    - pop_lift          # top1 / topK 推荐物品的流行度分位 − 全库均值
+    - delta_gap         # 推荐流行度 − 该用户历史流行度均值（个性化流行度漂移）
+    # 曝光集中度
+    - exposure_gini     # 全库曝光次数的 Gini
+    - exposure_entropy
+    - coverage          # topK 覆盖到的物品占全库比例
+    # 分层准确率（看 RL 是不是靠放弃长尾换总分）
+    - tier_hr           # hr@K_head / hr@K_mid / hr@K_tail
+    # 去偏后的准确率（流行度加权 IPS）
+    - ips               # hr_ips@K / ndcg_ips@K
+    # shortcut 迹象
+    - history_copy_rate # 推荐结果里已在用户历史中的比例
+    - top1_concentration # 所有用户的 top1 落在多少个不同物品上
+
+  ips_gamma: 1.0
+
+  # —— 探针（较贵，默认只在 stage 结束跑）——
+  probes:
+    enabled: [popularity, framing]
+    # position 探针只对候选集排序类任务有意义（DPO4Rec 的 reranker 输入顺序），
+    # 对 MiniOneRec 的全库生成式检索不适用，会被自动跳过。
+    available: [popularity, position, framing, recency]
+    max_examples: 256

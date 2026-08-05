@@ -1,0 +1,44 @@
+# =============================================================================
+# minionerec 冒烟配置 —— 几分钟跑完，用来验证环境 / 多卡 / wandb 是否正常。
+# 指标没有意义，只看三件事：能不能跑通、checkpoint 是不是只有一份、wandb 有没有数。
+#
+#     EXP=smoke_minionerec GPUS=0    bash run.sh     # 单卡
+#     EXP=smoke_minionerec GPUS=0,1  bash run.sh     # 验多卡 DDP（重点）
+# =============================================================================
+
+defaults:
+  - exp/minionerec_qwen05b_amazon
+
+experiment:
+  name: smoke_minionerec
+
+data:
+  max_train_samples: 128
+  max_eval_samples: 32
+
+train:
+  sft:
+    epochs: 1
+    max_steps: 5
+    eval_steps: 5
+    logging_steps: 1
+    per_device_batch_size: 1
+    gradient_accumulation_steps: 1
+    max_seq_length: 256
+  rl:
+    epochs: 1
+    max_steps: 5
+    eval_steps: 2
+    bias_eval_steps: 2
+    eval_examples: 16
+    logging_steps: 1
+    gradient_accumulation_steps: 1
+    grpo:
+      group_size: 4
+
+bias:
+  final_examples: 32
+
+wandb:
+  group: smoke
+  tags: [smoke, minionerec]

@@ -1,0 +1,21 @@
+# =============================================================================
+# 统一 backbone — 三条路线（MiniOneRec / Rec-R1 / DPO4Rec）共用同一个 LLM。
+# 上游各自用的是不同模型（MiniOneRec: Qwen2.5 系；Rec-R1: Qwen2.5-3B-Instruct；
+# DPO4Rec: Llama3.1-8B-Instruct），我们统一管理，让 bias 差异只来自训练方式。
+# =============================================================================
+
+model:
+  name: qwen2.5-0.5b-instruct
+  checkpoint: Qwen/Qwen2.5-0.5B-Instruct
+  # 本地权重优先（离线机器上把 HF 快照放这里）
+  local_path: data/models/Qwen2.5-0.5B-Instruct
+  dtype: ${hardware.precision}
+  gradient_checkpointing: ${hardware.gradient_checkpointing}
+  trust_remote_code: false
+  use_flash_attention: false      # V100 不支持
+
+  # 全参微调。LoRA 已从本框架移除：
+  # 官方 MiniOneRec 的 SFT 就是全参（可选冻结 LLM 只训新增 SID embedding），
+  # 用 LoRA 会低估 RL 对表征的改动，与我们的表征分析目标冲突。
+  full_finetuning: true
+  freeze_llm: false               # true = 只训新增的 SID embedding（MiniOneRec 提供的选项）

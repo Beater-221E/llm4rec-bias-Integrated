@@ -1,4 +1,4 @@
-"""Experiment logging backends (console + JSONL; TB/W&B stubs)."""
+"""Experiment logging backends: console + JSONL + wandb."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 
+from llm4rec.tracking.wandb_backend import NullRun, WandbRun, build_wandb_run
+
 
 class ExperimentLogger:
     """Fan-out logger for metrics and human-readable progress."""
@@ -25,9 +27,11 @@ class ExperimentLogger:
         console_enabled: bool = True,
         jsonl_enabled: bool = True,
         level: int = logging.INFO,
+        wandb_run: WandbRun | NullRun | None = None,
     ) -> None:
         self.run_dir = run_dir
         self.experiment_id = experiment_id
+        self.wandb = wandb_run or NullRun()
         self.console = Console(stderr=False)
         self._jsonl_path = (run_dir / "metrics.jsonl") if run_dir and jsonl_enabled else None
         self._console_log_path = (run_dir / "console.log") if run_dir else None
@@ -74,7 +78,15 @@ class ExperimentLogger:
         step: int | None = None,
         epoch: float | None = None,
         split: str | None = None,
+        wandb_prefix: str | None = None,
     ) -> None:
+        """记一批指标到 jsonl + wandb。
+
+        ``wandb_prefix`` 决定这批指标在 wandb 里落到哪个分组，例如
+        ``"train"`` → ``train/loss``，``"bias"`` → ``bias/pop_lift@1``。
+        默认按 split 推断（train/eval），推不出来就用 stage。
+        jsonl 始终写，即使 wandb 不可用也不会丢数据。
+        """
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "experiment_id": self.experiment_id,
@@ -87,6 +99,21 @@ class ExperimentLogger:
         if self._jsonl_path is not None:
             with self._jsonl_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, default=str) + "\n")
+
+        prefix = wandb_prefix or split or stage
+        payload = {f"{prefix}/{k}": v for k, v in metrics.items()}
+        if epoch is not None:
+            payload["progress/epoch"] = epoch
+        self.wandb.log(payload, step=step)
+
+    def set_stage(self, stage: str) -> None:
+        """切换阶段，在 wandb 上体现为 ``progress/stage_id`` 的跳变。"""
+        self.wandb.set_stage(stage)
+
+    def finish(self, summary: dict[str, Any] | None = None) -> None:
+        if summary:
+            self.wandb.log_summary(summary)
+        self.wandb.finish()
 
     def print_startup_summary(self, lines: list[str]) -> None:
         table = Table(title="Experiment startup", show_header=False, box=None)
@@ -187,10 +214,27 @@ class ExperimentLogger:
         return table
 
 
-def build_logger(tracking_cfg: dict[str, Any], run_dir: Path | None) -> ExperimentLogger:
+def build_logger(
+    tracking_cfg: dict[str, Any],
+    run_dir: Path | None,
+    *,
+    full_config: dict[str, Any] | None = None,
+    experiment_id: str = "",
+    is_main_process: bool = True,
+) -> ExperimentLogger:
+    """构建 logger。传入 ``full_config`` 才会启用 wandb（需要 wandb: 配置段）。"""
+    wandb_run: WandbRun | NullRun = NullRun()
+    if full_config is not None:
+        wandb_run = build_wandb_run(
+            full_config,
+            run_dir=run_dir,
+            experiment_id=experiment_id,
+            is_main_process=is_main_process,
+        )
     return ExperimentLogger(
         run_dir=run_dir,
-        experiment_id="",
+        experiment_id=experiment_id,
         console_enabled=bool(tracking_cfg.get("console", True)),
         jsonl_enabled=bool(tracking_cfg.get("jsonl", True)),
+        wandb_run=wandb_run,
     )

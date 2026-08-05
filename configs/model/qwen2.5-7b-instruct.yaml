@@ -1,0 +1,19 @@
+# =============================================================================
+# Backbone: Qwen/Qwen2.5-7B-Instruct
+# 更大规模；全参需 ZeRO-2/3
+#
+# 换 backbone 只改 exp 配置 defaults 里的这一行，或命令行：
+#   bash run.sh model.checkpoint=Qwen/Qwen2.5-7B-Instruct
+# 代码零改动 —— 加载走通用的 AutoModelForCausalLM。
+# =============================================================================
+
+model:
+  name: qwen2.5-7b-instruct
+  checkpoint: Qwen/Qwen2.5-7B-Instruct
+  local_path: data/models/Qwen2.5-7B-Instruct
+  dtype: ${hardware.precision}
+  gradient_checkpointing: ${hardware.gradient_checkpointing}
+  trust_remote_code: false
+  use_flash_attention: false
+  full_finetuning: true
+  freeze_llm: false

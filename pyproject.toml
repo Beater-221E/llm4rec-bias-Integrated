@@ -1,13 +1,12 @@
 [project]
 name = "llm4rec-bias-Integrated"
-version = "0.2.0"
-description = "Modular LLM4Rec Research Framework (MiniOneRec / MLLM4Rec / GRPO4Rec)"
+version = "1.0.0"
+description = "统一框架：MiniOneRec / Rec-R1 / DPO4Rec 三条 LLM4Rec 路线上的 RL bias 放大研究"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
 [project.scripts]
-llm4rec-bias-Integrated = "llm4rec.cli.main:main"
 llm4rec = "llm4rec.cli.main:main"
 
 [build-system]
@@ -15,15 +14,14 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/llm4rec", "src/llm4rec_bias_Integrated"]
+packages = ["src/llm4rec"]
 
 [tool.hatch.build.targets.wheel.sources]
 "src/llm4rec" = "llm4rec"
-"src/llm4rec_bias_Integrated" = "llm4rec_bias_Integrated"
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/llm4rec/workflows/mllm4rec/_stack/templates/alpaca_short.json" = "llm4rec/workflows/mllm4rec/_stack/templates/alpaca_short.json"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
