@@ -62,12 +62,17 @@ class ChatSFTDataset(Dataset):
         prompt_ids = tok.apply_chat_template(
             ex["prompt"], add_generation_prompt=True, tokenize=True
         )
+        # 兼容偶发的 BatchEncoding / str 返回
+        if hasattr(prompt_ids, "input_ids"):
+            prompt_ids = prompt_ids["input_ids"]
+        if isinstance(prompt_ids, str):
+            prompt_ids = tok(prompt_ids, add_special_tokens=False)["input_ids"]
         answer_ids = tok(str(ex["answer"]), add_special_tokens=False)["input_ids"]
         eos = tok.eos_token_id
         if eos is not None:
             answer_ids = answer_ids + [eos]
 
-        input_ids = list(prompt_ids) + list(answer_ids)
+        input_ids = [int(t) for t in prompt_ids] + [int(t) for t in answer_ids]
         labels = [IGNORE_INDEX] * len(prompt_ids) + list(answer_ids)
 
         # 超长时从【左边】截断：保住答案，砍掉最早的历史
