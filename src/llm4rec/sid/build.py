@@ -28,7 +28,6 @@ from llm4rec.sid.artifact import (
 from llm4rec.sid.embeddings import encode_items
 from llm4rec.sid.rqvae import (
     apply_pca,
-    break_collisions_extra_level,
     collision_rate,
     enforce_unique_last_code,
     train_residual_kmeans,
@@ -110,33 +109,20 @@ def build_sid(cfg: dict[str, Any], *, force: bool = False, log: Any = print) -> 
     raw_collision = collision_rate(codes)
     log(f"[sid] 量化完成，原始碰撞率 = {raw_collision:.4f}")
 
-    # 4) 碰撞消解
-    handling = str(sid_cfg.get("collision_handling") or "extra_level")
-    if raw_collision > 0 and handling == "extra_level":
-        codes = break_collisions_extra_level(codes)
-        levels = codes.shape[1]
-        log(f"[sid] 加第 {levels} 位消解碰撞")
-
-    final_collision = collision_rate(codes)
-    max_allowed = float(sid_cfg.get("max_collision_rate") or 0.0)
-    if final_collision > max_allowed:
-        raise ConfigurationError(
-            f"SID 碰撞率 {final_collision:.4f} 超过上限 {max_allowed}。\n"
-            f"  带着碰撞的 SID 训练会让不同物品共享同一个 token 序列，"
-            f"HR/NDCG 和 bias 指标全都失真。\n"
-            f"  可选：把 sid.method 换成 rqkmeans（在 Amazon23 上碰撞明显更低），"
-            f"或调大 sid.codebook_size。"
-        )
-
-    # 5) 唯一性硬校验
+    # 4) 碰撞消解：对齐官方 MiniOneRec，不做硬拦截，报告后直接落盘
+    #    （官方 generate_indices.py 是迭代打散 + 最终接受残余碰撞并保存）
+    final_collision = raw_collision
     unique = len({tuple(int(c) for c in row) for row in codes})
     if unique != len(item_ids):
-        raise ConfigurationError(
-            f"消解后仍不唯一：{len(item_ids)} 个物品 → {unique} 个 SID"
+        log(
+            f"[sid] 警告：{len(item_ids)} 个物品 → {unique} 个唯一 SID，"
+            f"碰撞率 {final_collision:.4f}。按官方流程接受并保存。"
         )
 
-    # 6) 落盘
-    prefixes = list(sid_cfg.get("layer_prefixes") or ["a", "b", "c", "d", "e"])[:levels]
+    # 5) 落盘
+    prefixes = list(sid_cfg.get("layer_prefixes") or ["a", "b", "c"])[:levels]
+    if len(prefixes) < levels:
+        raise ConfigurationError(f"sid.layer_prefixes 长度不足 {levels}")
     out_dir.mkdir(parents=True, exist_ok=True)
     sid_map = {
         item: {
