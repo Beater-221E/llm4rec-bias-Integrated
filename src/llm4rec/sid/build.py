@@ -34,7 +34,7 @@ from llm4rec.sid.rqvae import (
     train_residual_kmeans,
     train_rqvae,
 )
-from llm4rec.sid.table import format_sid
+from llm4rec.sid.table import DEFAULT_PREFIXES, format_sid
 
 
 def build_sid(cfg: dict[str, Any], *, force: bool = False, log: Any = print) -> Path:
@@ -136,7 +136,17 @@ def build_sid(cfg: dict[str, Any], *, force: bool = False, log: Any = print) -> 
         )
 
     # 6) 落盘
-    prefixes = list(sid_cfg.get("layer_prefixes") or ["a", "b", "c", "d", "e"])[:levels]
+    # extra_level 会把层数从 3 增到 4；配置里常只写 [a,b,c]，这里用默认前缀补齐。
+    configured = list(sid_cfg.get("layer_prefixes") or DEFAULT_PREFIXES)
+    if len(configured) < levels:
+        configured = list(configured) + [
+            p for p in DEFAULT_PREFIXES if p not in configured
+        ]
+    if len(configured) < levels:
+        # 仍不够就按字母续写（极端情况）
+        for i in range(len(configured), levels):
+            configured.append(chr(ord("a") + i))
+    prefixes = configured[:levels]
     out_dir.mkdir(parents=True, exist_ok=True)
     sid_map = {
         item: {

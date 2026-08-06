@@ -14,7 +14,8 @@ sid:
   # 但保留 rqkmeans 可切换，且构建后会强制报告碰撞率。
   levels: 3
   codebook_size: 256
-  layer_prefixes: [a, b, c]     # SID token 形如 <a_12><b_200><c_7>
+  # 预留 d：collision_handling=extra_level 时会加第 4 位，形如 <a_12><b_200><c_7><d_0>
+  layer_prefixes: [a, b, c, d, e]
   collision_handling: extra_level   # 加第 4 位打散碰撞；none = 不处理（会报错）
   max_collision_rate: 0.0       # 超过此比例直接失败，避免带着脏 SID 训练
 

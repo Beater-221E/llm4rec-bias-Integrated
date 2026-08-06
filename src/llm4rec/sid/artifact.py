@@ -170,7 +170,7 @@ def write_manifest(
         method=str(sid_cfg.get("method") or "rqvae"),
         levels=int(sid_cfg.get("levels") or 3),
         codebook_size=int(sid_cfg.get("codebook_size") or 256),
-        layer_prefixes=list(sid_cfg.get("layer_prefixes") or ["a", "b", "c"]),
+        layer_prefixes=list(sid_cfg.get("layer_prefixes") or ["a", "b", "c", "d", "e"]),
         n_items=int(n_items),
         collision_rate=float(collision_rate),
         encoder=str(_dig(sid_cfg, "encoder.model") or ""),
