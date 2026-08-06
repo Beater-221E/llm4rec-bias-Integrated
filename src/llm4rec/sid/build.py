@@ -30,6 +30,7 @@ from llm4rec.sid.rqvae import (
     apply_pca,
     collision_rate,
     enforce_unique_last_code,
+    resolve_collisions_sinkhorn,
     train_residual_kmeans,
     train_rqvae,
 )
@@ -95,6 +96,7 @@ def build_sid(cfg: dict[str, Any], *, force: bool = False, log: Any = print) -> 
             codebook_size=codebook_size,
             seed=seed,
             device=str((sid_cfg.get("encoder") or {}).get("device") or "cuda:0"),
+            out_dir=out_dir,
             log=log,
         )
     elif method == "rqkmeans":
@@ -109,9 +111,26 @@ def build_sid(cfg: dict[str, Any], *, force: bool = False, log: Any = print) -> 
     raw_collision = collision_rate(codes)
     log(f"[sid] 量化完成，原始碰撞率 = {raw_collision:.4f}")
 
-    # 4) 碰撞消解：对齐官方 MiniOneRec，不做硬拦截，报告后直接落盘
-    #    （官方 generate_indices.py 是迭代打散 + 最终接受残余碰撞并保存）
-    final_collision = raw_collision
+    # 4) 官方冲突后处理：只开最后一层 Sinkhorn 重分配，仍按原样落盘
+    if method == "rqvae" and model is not None:
+        import torch
+
+        sk_eps = float(
+            (sid_cfg.get("rqvae") or {}).get("sk_epsilon_last")
+            or (sid_cfg.get("rqvae") or {}).get("sk_epsilon")
+            or 0.003
+        )
+        codes = resolve_collisions_sinkhorn(
+            model,
+            torch.tensor(features, dtype=torch.float32),
+            codes,
+            sk_epsilon=sk_eps,
+            max_iters=int((sid_cfg.get("rqvae") or {}).get("collision_retry_iters") or 20),
+            device=str((sid_cfg.get("encoder") or {}).get("device") or "cuda:0"),
+            log=log,
+        )
+
+    final_collision = collision_rate(codes)
     unique = len({tuple(int(c) for c in row) for row in codes})
     if unique != len(item_ids):
         log(

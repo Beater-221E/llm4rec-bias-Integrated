@@ -57,13 +57,16 @@ class SidTable:
             codes = entry["codes"] if isinstance(entry, dict) else entry
             self.codes[str(item_id)] = tuple(int(c) for c in codes)
 
+        # 允许碰撞：同码物品按构建顺序保留
         self.item_of: dict[tuple[int, ...], str] = {
             codes: item for item, codes in self.codes.items()
         }
         if len(self.item_of) != len(self.codes):
-            raise ConfigurationError(
-                f"{path} 里的 SID 存在碰撞（{len(self.codes)} 个物品只映射到 "
-                f"{len(self.item_of)} 个唯一 SID）。产物不该出现这种情况，请重建。"
+            import warnings
+
+            warnings.warn(
+                f"SID 存在碰撞：{len(self.codes)} 物品 → {len(self.item_of)} 唯一 SID（{path}）",
+                RuntimeWarning,
             )
 
         self._pattern = re.compile(

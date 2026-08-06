@@ -27,19 +27,25 @@ sid:
     dtype: fp16
     device: cuda:0
 
-  # —— RQ-VAE 训练 ——
+  # —— RQ-VAE 训练（对齐官方 MiniOneRec）——
   rqvae:
     pca_dim: 512                # RQ 之前先 PCA 降维
     latent_dim: 64
     hidden_dim: 512
     beta: 0.25                  # commitment loss 权重
-    epochs: 2000                
+    epochs: 2000
     batch_size: 2048
     lr: 3.0e-4
     warm_start_size: 8192       # KMeans warm-start 采样数
+    kmeans_init: true           # 官方 kmeans_init=True
+    kmeans_iters: 100
     dead_code_every: 100        # 每 N epoch 用高残差样本重置死码
     log_every: 50
     early_collision_patience: 40
+    # 官方 generate_indices.py 冲突后处理
+    sk_iters: 50
+    sk_epsilon_last: 0.003      # 只在最后一层开 Sinkhorn
+    collision_retry_iters: 20   # 最多重试轮数
 
   # —— rqkmeans 分支（method: rqkmeans 时生效）——
   rqkmeans:
