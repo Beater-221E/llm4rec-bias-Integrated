@@ -33,7 +33,7 @@ sid:
     latent_dim: 64
     hidden_dim: 512
     beta: 0.25                  # commitment loss 权重
-    epochs: 2000                 
+    epochs: 20                  # 对齐官方碰撞重试轮数上限
     batch_size: 2048
     lr: 3.0e-4
     warm_start_size: 8192       # KMeans warm-start 采样数
