@@ -13,7 +13,7 @@ sid:
   # residual-kmeans，所以它默认切到了 rqkmeans。这里按官方设定用 rqvae，
   # 但保留 rqkmeans 可切换，且构建后会强制报告碰撞率。
   levels: 3
-  codebook_size: 256
+  codebook_size: 512
   layer_prefixes: [a, b, c]     # SID token 形如 <a_12><b_200><c_7>
   collision_handling: none   # 加第 4 位打散碰撞；none = 不处理（会报错）
   max_collision_rate: 0.0       # 超过此比例直接失败，避免带着脏 SID 训练
