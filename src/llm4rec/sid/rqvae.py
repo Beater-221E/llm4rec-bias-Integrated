@@ -1,17 +1,11 @@
-"""RQ-VAE：物品 embedding → 3 层残差量化码 → Semantic ID。
+"""RQ-VAE：物品 embedding → 3 层残差量化码 → Semantic ID（integrated / simplified）.
 
-对齐官方 MiniOneRec（``rq/models/rqvae.py``）：冻结 text encoder 编码
-title+description，再用 3 层 RQ-VAE 量化。
+For MiniOneRec *reproduction* mode, use
+``llm4rec.sid.minionerec_rqvae`` instead — that path ports the official
+architecture (no PCA, layers=[2048..64], e_dim=32, codebooks=[256,256,256]).
 
-相对朴素 VQ 的几个必要改进（移植自 mor-reproduce，都是踩过坑的）：
-  * 量化前先 L2 归一化 → PCA 降维 → 再 L2 归一化
-  * 码本用大样本 KMeans warm-start，而不是拿一个 mini-batch 初始化
-  * 周期性用高残差样本重置死码（否则码本利用率会塌到个位数）
-  * 逐层码本利用率日志 + 碰撞率早停
-
-★ 已知风险：mor-reproduce 实测在 Amazon23 Industrial 上 RQ-VAE 的碰撞率
-  高于 residual-kmeans，所以它默认切到了 rqkmeans。这里按官方设定用 rqvae，
-  但 build 时会强制检查碰撞率，超过 ``sid.max_collision_rate`` 直接失败。
+This module keeps the generalized/simplified RQ-VAE used by ``mode: integrated``
+experiments (optional PCA, compact MLP, dead-code reset, etc.).
 """
 
 from __future__ import annotations
@@ -23,18 +17,41 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from llm4rec.sid.base import collision_groups, collision_rate
+from llm4rec.sid.collision import enforce_unique_last_code, resolve_collisions_sinkhorn
+
+__all__ = [
+    "RQVAE",
+    "apply_pca",
+    "train_rqvae",
+    "train_residual_kmeans",
+    "collision_rate",
+    "collision_groups",
+    "resolve_collisions_sinkhorn",
+    "enforce_unique_last_code",
+]
+
 
 def sinkhorn(logits: torch.Tensor, epsilon: float, iters: int = 50) -> torch.Tensor:
-    """Sinkhorn-Knopp 在最后一维上做近似均匀分配（对齐官方 rq/rq.py）。"""
-    n = logits.shape[0]
-    q = torch.exp(logits / epsilon).t()
-    q /= q.sum()
-    r = torch.ones(q.shape[0], device=logits.device)
-    c = torch.full((q.shape[1],), 1.0 / n, device=logits.device)
+    """Sinkhorn-Knopp soft assignment over the last dim (codebook).
+
+    ``logits`` is ``[B, K]`` (typically ``-distance``). Aligns with MiniOneRec's
+    ``sinkhorn_algorithm`` but accepts logits instead of distances.
+
+    Previous implementation transposed to ``[K, B]`` and used 1-D row/column
+    marginals; PyTorch broadcasting then turned ``r / q.sum(dim=1)`` into a
+    ``[K, K]`` tensor whenever ``B != K``, which is exactly the collision-group
+    case (small B, large codebook).
+    """
+    q = torch.exp(logits / epsilon)
+    b, k = q.shape
+    q = q / q.sum().clamp(min=1e-12)
     for _ in range(iters):
-        q *= (r / q.sum(dim=1, keepdim=True)).clamp(min=1e-12)
-        q *= (c / q.sum(dim=0, keepdim=True)).clamp(min=1e-12)
-    return (q * n).t()
+        q = q / q.sum(dim=1, keepdim=True).clamp(min=1e-12)
+        q = q / b
+        q = q / q.sum(dim=0, keepdim=True).clamp(min=1e-12)
+        q = q / k
+    return q * b
 
 
 class RQVAE(nn.Module):
@@ -61,7 +78,6 @@ class RQVAE(nn.Module):
         self.kmeans_init = kmeans_init
         self.kmeans_iters = kmeans_iters
         self.sk_iters = sk_iters
-        # 默认全 0（训练/常规编码不开 Sinkhorn）；碰撞后处理时只开最后一层
         self.sk_epsilons = list(
             sk_epsilons if sk_epsilons is not None else [0.0] * num_layers
         )
@@ -87,10 +103,8 @@ class RQVAE(nn.Module):
             ]
         )
 
-    # ------------------------------------------------------------ 初始化
     @torch.no_grad()
     def warm_start(self, batch: torch.Tensor, seed: int = 42) -> None:
-        """用一大批样本做逐层 KMeans 初始化。"""
         from sklearn.cluster import KMeans
 
         residual = self.encoder(batch)
@@ -103,13 +117,13 @@ class RQVAE(nn.Module):
                 km.cluster_centers_, device=batch.device, dtype=batch.dtype
             )
             if k < self.codebook_size:
-                # 样本数不足以填满码本时，复制已有中心并加噪补齐
                 idx = torch.randint(0, k, (self.codebook_size - k,), device=batch.device)
-                centers = torch.cat([centers, centers[idx] + 0.01 * torch.randn_like(centers[idx])])
+                centers = torch.cat(
+                    [centers, centers[idx] + 0.01 * torch.randn_like(centers[idx])]
+                )
             self.codebooks[layer].copy_(centers)
             residual = residual - centers[torch.cdist(residual, centers).argmin(dim=-1)]
 
-    # ------------------------------------------------------------ 量化
     def quantize(self, z: torch.Tensor, use_sk: bool = False):
         residual = z
         indices: list[torch.Tensor] = []
@@ -118,7 +132,6 @@ class RQVAE(nn.Module):
         for layer in range(self.num_layers):
             cb = self.codebooks[layer]
             dist = torch.cdist(residual, cb)
-            # 官方 generate_indices.py：冲突重分配时只开最后一层 Sinkhorn
             if use_sk and self.sk_epsilons[layer] > 0.0:
                 idx = sinkhorn(-dist, self.sk_epsilons[layer], self.sk_iters).argmax(dim=-1)
             else:
@@ -129,7 +142,6 @@ class RQVAE(nn.Module):
                 + F.mse_loss(residual.detach(), quantized)
                 + self.beta * F.mse_loss(residual, quantized.detach())
             )
-            # straight-through：前向用量化值，反向梯度直通到 residual
             quantized_sum = quantized_sum + residual + (quantized - residual).detach()
             residual = residual - quantized
             indices.append(idx)
@@ -160,7 +172,6 @@ class RQVAE(nn.Module):
     def reset_dead_codes(
         self, x: torch.Tensor, usage: list[np.ndarray], min_count: int = 1
     ) -> list[int]:
-        """把没被用到的码本条目替换成拟合最差（残差范数最大）的样本。"""
         residuals = self.layer_residuals(x)
         resets = []
         for layer, (res, counts) in enumerate(zip(residuals, usage)):
@@ -177,11 +188,8 @@ class RQVAE(nn.Module):
         return resets
 
 
-# ---------------------------------------------------------------- 预处理
-
-
 def apply_pca(emb: np.ndarray, pca_dim: int, seed: int = 42) -> tuple[np.ndarray, dict]:
-    """L2 归一化 → PCA → L2 归一化。"""
+    """L2 归一化 → PCA → L2 归一化（integrated mode only）。"""
     from sklearn.decomposition import PCA
 
     norms = np.linalg.norm(emb, axis=1, keepdims=True).clip(min=1e-8)
@@ -197,9 +205,6 @@ def apply_pca(emb: np.ndarray, pca_dim: int, seed: int = 42) -> tuple[np.ndarray
     }
 
 
-# ---------------------------------------------------------------- 训练
-
-
 def train_rqvae(
     features: np.ndarray,
     cfg: dict[str, Any],
@@ -211,11 +216,7 @@ def train_rqvae(
     out_dir: Any = None,
     log: Any = print,
 ) -> tuple[RQVAE, np.ndarray]:
-    """训练 RQ-VAE，返回 ``(模型, 每个物品的码)``。
-
-    对齐官方：KMeans warm-start + 训练期周期性评估 collision，
-    并保存 best_loss / best_collision 两个 checkpoint。
-    """
+    """Train simplified/integrated RQ-VAE."""
     from pathlib import Path
 
     from torch.utils.data import DataLoader, TensorDataset
@@ -273,10 +274,7 @@ def train_rqvae(
                     "num_layers": model.num_layers,
                     "codebook_size": model.codebook_size,
                     "beta": model.beta,
-                    "kmeans_init": model.kmeans_init,
-                    "kmeans_iters": model.kmeans_iters,
-                    "sk_iters": model.sk_iters,
-                    "sk_epsilons": model.sk_epsilons,
+                    "implementation": "integrated_simplified",
                 },
             },
             path,
@@ -331,11 +329,15 @@ def train_rqvae(
                 log(f"[rqvae] 碰撞率 {patience} 次检查无改善，提前停止")
                 break
 
-    # 官方流程：生成 SID 时用 best_collision 模型
     if out_dir is not None and (out_dir / "best_collision_model.pth").exists():
-        ckpt = torch.load(out_dir / "best_collision_model.pth", map_location=dev, weights_only=False)
+        ckpt = torch.load(
+            out_dir / "best_collision_model.pth", map_location=dev, weights_only=False
+        )
         model.load_state_dict(ckpt["state_dict"])
-        log(f"[rqvae] 已加载 best_collision_model（epoch={ckpt['epoch']} 碰撞率={ckpt['metric']:.4f}）")
+        log(
+            f"[rqvae] 已加载 best_collision_model"
+            f"（epoch={ckpt['epoch']} 碰撞率={ckpt['metric']:.4f}）"
+        )
 
     return model, _encode_all(model, all_x)
 
@@ -349,18 +351,6 @@ def _encode_all(model: RQVAE, x: torch.Tensor, chunk: int = 8192) -> np.ndarray:
     return np.concatenate(out, axis=0)
 
 
-def collision_rate(codes: np.ndarray) -> float:
-    """有多少比例的物品和别人撞了码。"""
-    n = codes.shape[0]
-    if n == 0:
-        return 0.0
-    unique = len({tuple(int(c) for c in row) for row in codes})
-    return float((n - unique) / n)
-
-
-# ------------------------------------------------------- residual k-means 分支
-
-
 def train_residual_kmeans(
     features: np.ndarray,
     *,
@@ -369,11 +359,6 @@ def train_residual_kmeans(
     seed: int = 42,
     log: Any = print,
 ) -> np.ndarray:
-    """逐层 KMeans 残差量化（无神经网络）。
-
-    官方也提供这一支（RQ-Kmeans）。在 Amazon23 Industrial 上 mor-reproduce
-    实测它的碰撞率明显低于 RQ-VAE，所以留作可切换的备选。
-    """
     from sklearn.cluster import KMeans
 
     residual = features.astype(np.float32).copy()
@@ -386,82 +371,3 @@ def train_residual_kmeans(
         residual = residual - km.cluster_centers_[assign]
         log(f"[rqkmeans] 第 {layer} 层完成，使用了 {len(set(assign))}/{codebook_size} 个码")
     return codes
-
-
-def enforce_unique_last_code(codes: np.ndarray, codebook_size: int) -> np.ndarray:
-    """保住前 n-1 层的语义前缀，只在同前缀桶内重排最后一位来消除碰撞。"""
-    from collections import defaultdict
-
-    out = codes.copy()
-    last = codes.shape[1] - 1
-    groups: dict[tuple, list[int]] = defaultdict(list)
-    for i, row in enumerate(codes):
-        groups[tuple(int(c) for c in row[:last])].append(i)
-    for prefix, members in groups.items():
-        if len(members) <= 1:
-            continue
-        members.sort(key=lambda i: (int(codes[i, last]), i))
-        if len(members) > codebook_size:
-            # 极罕见：桶比码本还大，溢出到相邻的上一层码
-            for j, i in enumerate(members):
-                out[i, last] = j % codebook_size
-                out[i, last - 1] = (prefix[last - 1] + j // codebook_size) % codebook_size
-        else:
-            for j, i in enumerate(members):
-                out[i, last] = j
-    return out
-
-
-# ---------------------------------------------------------------- 官方冲突后处理
-
-
-def collision_groups(codes: np.ndarray) -> list[list[int]]:
-    """返回所有共享同一组完整 SID 的物品 index 分组。"""
-    from collections import defaultdict
-
-    groups: dict[tuple, list[int]] = defaultdict(list)
-    for i, row in enumerate(codes):
-        groups[tuple(int(c) for c in row)].append(i)
-    return [g for g in groups.values() if len(g) > 1]
-
-
-def resolve_collisions_sinkhorn(
-    model: RQVAE,
-    x: torch.Tensor,
-    codes: np.ndarray,
-    *,
-    sk_epsilon: float = 0.003,
-    max_iters: int = 20,
-    device: str = "cuda:0",
-    log: Any = print,
-) -> np.ndarray:
-    """对齐官方 generate_indices.py：
-
-    1. 前两层关闭 Sinkhorn，只在最后一层设 sk_epsilon；
-    2. 反复找出完整 SID 冲突的 item，仅对这些 item 用 Sinkhorn 重新量化；
-    3. 最多 20 轮，或全部唯一时提前停止。
-    """
-    dev = torch.device(device if torch.cuda.is_available() else "cpu")
-    model = model.to(dev).eval()
-
-    # 官方：for vq in model.rq.vq_layers[:-1]: vq.sk_epsilon = 0.0
-    model.sk_epsilons = [0.0] * (model.num_layers - 1) + [sk_epsilon]
-
-    all_x = x.to(dev)
-    out = codes.copy()
-    it = 0
-    while True:
-        unique = len({tuple(int(c) for c in row) for row in out})
-        rate = (len(out) - unique) / len(out)
-        if it >= max_iters or unique == len(out):
-            log(f"[sid] Sinkhorn 后处理：轮数={it} 碰撞率={rate:.4f}")
-            break
-        groups = collision_groups(out)
-        log(f"[sid]   第 {it + 1} 轮：冲突组 {len(groups)} 个")
-        for members in groups:
-            batch = all_x[torch.tensor(members, device=dev)]
-            idx = model.encode_indices(batch, use_sk=True).cpu().numpy()
-            for pos, item_idx in enumerate(members):
-                out[item_idx] = idx[pos]
-        it += 1
-    return out

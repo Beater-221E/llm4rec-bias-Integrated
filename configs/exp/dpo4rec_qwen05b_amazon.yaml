@@ -18,7 +18,7 @@ defaults:
   - model/qwen2.5-0.5b-instruct
   - bias/default
 
-experiment: {name: dpo4rec_qwen05b_amazon, route: dpo4rec}
+experiment: {name: dpo4rec_qwen05b_amazon, route: dpo4rec, mode: integrated}
 seed: 42
 stages: [train_reranker, sft, eval, dpo, eval]
 
@@ -29,8 +29,10 @@ data:
   max_eval_samples: -1
 
 hardware:
-  devices: "0,1,2,3"
-  precision: fp32
+  devices: auto
+  precision: auto
+  strategy: auto
+  memory: auto
   gradient_checkpointing: true
   deepspeed: null
 
@@ -108,7 +110,7 @@ train:
       top_k: 5                  # 论文用 NDCG@5 / MAP@5
 
 bias: {online_stages: [dpo], top_k: 10, final_examples: null, ips_gamma: 1.0}
-checkpoint: {save_stage_final: true, save_steps: null, save_total_limit: 1}
+checkpoint: {save_stage_final: true, save_steps: 500, save_total_limit: 3}
 wandb:
   enabled: true
   project: llm4rec-bias

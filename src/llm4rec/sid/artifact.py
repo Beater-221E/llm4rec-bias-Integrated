@@ -37,6 +37,7 @@ STATS_NAME = "build_stats.json"
 # 训练超参（lr / epochs 之类）不进 hash —— 它们不改变最终的码本语义契约。
 _HASH_KEYS = (
     "method",
+    "implementation",
     "levels",
     "codebook_size",
     "layer_prefixes",
@@ -46,6 +47,9 @@ _HASH_KEYS = (
     "encoder.pooling",
     "rqvae.pca_dim",
     "rqvae.latent_dim",
+    "rqvae.e_dim",
+    "rqvae.layers",
+    "rqvae.num_emb_list",
     "rqkmeans.pca_dim",
     "rqkmeans.enforce_unique",
 )

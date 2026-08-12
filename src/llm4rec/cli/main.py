@@ -172,7 +172,11 @@ def cmd_list() -> int:
 
 
 def cmd_validate(cfg: dict[str, Any]) -> int:
+    from llm4rec.runtime.preflight import run_preflight
+
     _print_plan(cfg)
+    print(f"mode           : {cfg.get('mode') or (cfg.get('experiment') or {}).get('mode')}")
+    run_preflight(cfg)
     print("\n配置校验通过 ✓")
     return 0
 
@@ -243,10 +247,13 @@ def cmd_build_bm25(cfg: dict[str, Any], force: bool) -> int:
 def cmd_run(cfg: dict[str, Any]) -> int:
     from llm4rec.core.reproducibility import collect_environment, write_json
     from llm4rec.pipeline import build_pipeline
+    from llm4rec.runtime.hardware import apply_nccl_compat_profile
+    from llm4rec.runtime.preflight import run_preflight
     from llm4rec.tracking.logger import build_logger
 
     set_seed(int(cfg["seed"]))
     main_process = _is_main_process()
+    apply_nccl_compat_profile()
     run_dir = _build_run_dir(cfg)
 
     exp = cfg["experiment"]
@@ -264,13 +271,19 @@ def cmd_run(cfg: dict[str, Any]) -> int:
 
     if main_process:
         _print_plan(cfg)
+        print(f"mode           : {cfg.get('mode')}")
         print(f"\n输出目录      : {run_dir}")
         if logger.wandb.url:
             print(f"wandb run     : {logger.wandb.url}")
+        run_preflight(cfg, log=logger.info if hasattr(logger, "info") else print)
         write_json(run_dir / "resolved_config.json", cfg)
         env = collect_environment(project_root())
         env["experiment_id"] = experiment_id
+        env["hardware"] = (cfg.get("hardware") or {}).get("_hardware")
         write_json(run_dir / "environment.json", env)
+    else:
+        # Non-main ranks still need batch/precision resolution for identical training.
+        run_preflight(cfg, log=lambda *_a, **_k: None)
 
     pipeline = build_pipeline(cfg, run_dir, logger)
     try:

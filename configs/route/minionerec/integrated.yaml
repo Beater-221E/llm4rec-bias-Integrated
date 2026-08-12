@@ -1,0 +1,54 @@
+# MiniOneRec integrated research profile.
+
+mode: integrated
+
+experiment:
+  mode: integrated
+
+# SID: inherit configs/sid/rqvae.yaml only (listed in the exp defaults).
+
+optimization:
+  compile:
+    enabled: auto
+    backend: inductor
+    mode: default
+
+train:
+  sft:
+    tasks: [seqrec, title2sid, sid2title]
+    epochs: 3
+    learning_rate: 1.0e-5
+    lr_scheduler_type: cosine
+    warmup_ratio: 0.03
+    global_batch_size: 64
+    per_device_batch_size: 2
+    gradient_accumulation_steps: 8
+    max_seq_length: 512
+    logging_steps: 10
+    eval_steps: 200
+
+  rl:
+    algorithm: grpo
+    epochs: 2
+    eval_steps: 25
+    bias_eval_steps: 25
+    eval_examples: 256
+    logging_steps: 1
+    learning_rate: 1.0e-5
+    max_grad_norm: 0.3
+    global_batch_size: 8
+    per_device_batch_size: 1
+    gradient_accumulation_steps: 8
+    max_prompt_length: 512
+    grpo:
+      group_size: 16
+      beta: 1.0e-3
+      clip_epsilon: 0.2
+      temperature: 1.0
+      constrained_rollout: true
+      sync_ref_model: true
+      ref_model_mixup_alpha: 0.6
+      ref_model_sync_steps: 512
+    reward:
+      type: ranking
+      invalid_penalty: -1.0

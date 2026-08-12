@@ -1,17 +1,17 @@
 """SID 表：item ↔ 语义码，以及约束解码用的前缀树。
 
 ★ token 格式对齐**官方 MiniOneRec**：``<a_12><b_200><c_7>``
-  （官方 ``rq/generate_indices.py`` 的 ``prefix = ["<a_{}>","<b_{}>",...]``，
-   mor-reproduce 的 ``sid/codec.py`` 也是这个格式）
 
-原 Integrated 仓库用的是 ``<s0_12><s1_200>``，和官方/mor-reproduce 都对不上。
-换成官方格式之后，mor-reproduce 已经训好的 checkpoint 的新增 embedding
-才能原样对上词表，不用重训。
+Collision-safe mapping:
+  ``sid_to_items: dict[SID, list[ItemId]]`` — never silently overwrite.
+  Unique-item decoding uses deterministic first-by-sorted-id resolution and logs
+  when ambiguity occurs.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -20,6 +20,7 @@ from llm4rec.core.exceptions import ConfigurationError, MissingArtifactError
 from llm4rec.sid.artifact import SID_MAP_NAME, load_manifest
 
 DEFAULT_PREFIXES = ("a", "b", "c", "d", "e")
+_LOG = logging.getLogger(__name__)
 
 
 def sid_token(layer: int, code: int, prefixes: Sequence[str] = DEFAULT_PREFIXES) -> str:
@@ -57,25 +58,64 @@ class SidTable:
             codes = entry["codes"] if isinstance(entry, dict) else entry
             self.codes[str(item_id)] = tuple(int(c) for c in codes)
 
-        # 允许碰撞：同码物品按构建顺序保留
-        self.item_of: dict[tuple[int, ...], str] = {
-            codes: item for item, codes in self.codes.items()
-        }
-        if len(self.item_of) != len(self.codes):
-            import warnings
+        # Collision-safe reverse map: never overwrite earlier items.
+        self.sid_to_items: dict[tuple[int, ...], list[str]] = {}
+        for item, codes in self.codes.items():
+            self.sid_to_items.setdefault(codes, []).append(item)
+        for sid, items in self.sid_to_items.items():
+            items.sort()  # deterministic order for decode
 
-            warnings.warn(
-                f"SID 存在碰撞：{len(self.codes)} 物品 → {len(self.item_of)} 唯一 SID（{path}）",
-                RuntimeWarning,
+        n_unique = len(self.sid_to_items)
+        if n_unique != len(self.codes):
+            _LOG.warning(
+                "SID collisions present: %d items → %d unique SIDs (%s)",
+                len(self.codes),
+                n_unique,
+                path,
             )
+
+        # Backward-compatible single-item view (deterministic first item).
+        self.item_of: dict[tuple[int, ...], str] = {
+            sid: items[0] for sid, items in self.sid_to_items.items()
+        }
 
         self._pattern = re.compile(
             r"<(" + "|".join(re.escape(p) for p in self.prefixes) + r")_(\d+)>"
         )
+        self._ambiguity_count = 0
+        self._ambiguity_logged: set[tuple[int, ...]] = set()
 
     # ------------------------------------------------------------------ 编解码
     def sid(self, item_id: str | int) -> str:
         return format_sid(self.codes[str(item_id)], self.prefixes)
+
+    def items_for_sid(self, codes: Sequence[int]) -> list[str]:
+        return list(self.sid_to_items.get(tuple(int(c) for c in codes), []))
+
+    def resolve_item(
+        self, codes: Sequence[int], *, log_ambiguity: bool = False
+    ) -> str | None:
+        """Deterministic unique-item resolution for evaluation.
+
+        When multiple catalog items share a SID, returns the lexicographically
+        smallest item id. Ambiguity is counted on ``_ambiguity_count``; per-hit
+        logging is off by default (eval spam).
+        """
+        items = self.items_for_sid(codes)
+        if not items:
+            return None
+        if len(items) > 1:
+            self._ambiguity_count += 1
+            key = tuple(int(c) for c in codes)
+            if log_ambiguity and key not in self._ambiguity_logged:
+                self._ambiguity_logged.add(key)
+                _LOG.debug(
+                    "SID ambiguity: codes=%s maps to %d items; using id=%s",
+                    key,
+                    len(items),
+                    items[0],
+                )
+        return items[0]
 
     def all_tokens(self) -> list[str]:
         """需要加进 tokenizer 的全部新 token。"""
@@ -92,7 +132,6 @@ class SidTable:
         for prefix, code in matches:
             expected = self.prefixes[len(codes)]
             if prefix != expected:
-                # 层序错乱 → 这一段不是合法 SID，重头再找
                 if prefix == self.prefixes[0]:
                     codes = [int(code)]
                 else:
@@ -100,8 +139,25 @@ class SidTable:
                 continue
             codes.append(int(code))
             if len(codes) == self.levels:
-                return self.item_of.get(tuple(codes))
+                return self.resolve_item(codes)
         return None
+
+    def parse_all(self, text: str) -> list[str]:
+        """Return all items that share the parsed SID (empty if invalid)."""
+        matches = self._pattern.findall(text)
+        codes: list[int] = []
+        for prefix, code in matches:
+            expected = self.prefixes[len(codes)]
+            if prefix != expected:
+                if prefix == self.prefixes[0]:
+                    codes = [int(code)]
+                else:
+                    codes = []
+                continue
+            codes.append(int(code))
+            if len(codes) == self.levels:
+                return self.items_for_sid(codes)
+        return []
 
     # ------------------------------------------------------------- 约束解码
     def build_trie(self, tokenizer: Any, eos_id: int) -> dict:
@@ -124,11 +180,7 @@ class SidTable:
         return root
 
     def prefix_allowed_fn(self, tokenizer: Any, prompt_len: int, eos_id: int):
-        """给 ``model.generate(prefix_allowed_tokens_fn=...)`` 用。
-
-        保证每条 beam 都走在前缀树上 —— 也就是官方说的
-        "every beam is unique and valid"，非法 SID 率恒为 0。
-        """
+        """给 ``model.generate(prefix_allowed_tokens_fn=...)`` 用。"""
         root = self.build_trie(tokenizer, eos_id)
 
         def fn(batch_id: int, input_ids: Any) -> list[int]:
@@ -144,6 +196,16 @@ class SidTable:
         return fn
 
     # ------------------------------------------------------------------ 其它
+    def collision_summary(self) -> dict[str, Any]:
+        colliding = {sid: items for sid, items in self.sid_to_items.items() if len(items) > 1}
+        return {
+            "n_items": len(self.codes),
+            "n_unique_sids": len(self.sid_to_items),
+            "num_collision_groups": len(colliding),
+            "max_collision_group_size": max((len(v) for v in colliding.values()), default=0),
+            "ambiguity_resolutions_logged": self._ambiguity_count,
+        }
+
     def items(self) -> Iterable[str]:
         return self.codes.keys()
 

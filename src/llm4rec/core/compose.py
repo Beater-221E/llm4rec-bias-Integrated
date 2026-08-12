@@ -188,6 +188,12 @@ def validate(cfg: DictConfig | dict[str, Any]) -> dict[str, Any]:
     """在真正加载模型/数据之前把配置错误挡下来。"""
     data = to_dict(cfg)
 
+    # Apply reproduction / integrated mode defaults before validation.
+    from llm4rec.core.modes import apply_mode_defaults, get_mode, verify_minionerec_reproduction
+
+    data = apply_mode_defaults(data)
+    mode = get_mode(data)
+
     for key in ("experiment", "data", "model", "stages", "paths", "wandb", "bias"):
         if key not in data:
             raise ConfigurationError(f"配置缺少顶层键 '{key}'")
@@ -200,16 +206,24 @@ def validate(cfg: DictConfig | dict[str, Any]) -> dict[str, Any]:
         raise ConfigurationError(
             f"experiment.route 必须是 {_ROUTES} 之一，得到 {route!r}"
         )
+    data["mode"] = mode
+    exp["mode"] = mode
 
     stages = data["stages"]
     if not isinstance(stages, list) or not stages:
         raise ConfigurationError("stages 必须是非空列表")
-    allowed = _ROUTE_STAGES[route]
+    # Reproduction Rec-R1 may omit SFT (official has no SFT stage).
+    allowed = set(_ROUTE_STAGES[route])
+    if route == "recr1" and mode == "reproduction":
+        allowed = {"rl", "eval", "sft"}  # sft optional
     unknown = [s for s in stages if s not in allowed]
     if unknown:
         raise ConfigurationError(
             f"route '{route}' 不支持这些 stage: {unknown}（可用：{sorted(allowed)}）"
         )
+    if route == "recr1" and mode == "reproduction" and "sft" in stages:
+        # Allowed but documented as an integrated deviation.
+        pass
 
     model = data["model"]
     if not isinstance(model, dict) or not model.get("checkpoint"):
@@ -243,6 +257,9 @@ def validate(cfg: DictConfig | dict[str, Any]) -> dict[str, Any]:
             raise ConfigurationError(
                 f"stages 里有 '{stage}'，但配置缺少 train.{key} 块"
             )
+
+    if mode == "reproduction" and route == "minionerec":
+        verify_minionerec_reproduction(data)
 
     return data
 

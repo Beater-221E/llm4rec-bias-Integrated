@@ -6,20 +6,50 @@
 同一份数据、同一套 bias 指标上 —— 这样 bias 的差异才能归因到训练方式，而不是
 "它们本来就不一样"。
 
+本仓库提供两种实验模式（同一套 trainer，用配置切换默认值）：
+
+| Mode | 目的 |
+|---|---|
+| **`reproduction`** | 尽量忠实于原论文/原仓库的 SID、超参与阶段编排 |
+| **`integrated`** | 统一数据 / backbone /（可选）SFT / 评测 / bias 分析，比较路线算法差异 |
+
+**不要假设每一条路线在任何配置下都与原文逐行等价。** 只有 `mode: reproduction`
+且对应官方依赖可用时，才按 reproduction 契约对齐；`integrated` 刻意保留统一研究设定。
+
+### MiniOneRec reproduction scope (intentional)
+
+MiniOneRec reproduction mode reproduces MiniOneRec's SID, SFT objective,
+tokenization/prompt, GRPO/reward, and optimization semantics on the project's
+unified dataset/split protocol.
+
+It is therefore an **algorithm/training-semantic reproduction** rather than a
+byte-for-byte reproduction of MiniOneRec's original preprocessed data files.
+
+```yaml
+reproduction_scope:
+  method: minionerec
+  algorithm_semantics: reference
+  data_protocol: integrated_unified
+```
+
+Do **not** expect a MiniOneRec upstream CSV preprocessing pipeline in this repo.
+
 ---
 
 ## 目录
 
 - [三条路线：原文 & 我们的实现](#三条路线原文--我们的实现)
+- [Reproduction Mode vs Integrated Research Mode](#reproduction-mode-vs-integrated-research-mode)
 - [框架是怎么统一的](#框架是怎么统一的)
 - [环境](#环境)
 - [跑一个实验](#跑一个实验)
+- [硬件兼容性](#硬件兼容性)
 - [配置](#配置)
 - [结果在哪](#结果在哪)
 - [bias 指标](#bias-指标)
 - [wandb](#wandb)
 - [多卡与 DeepSpeed](#多卡与-deepspeed)
-- [Semantic ID：静态产物与导入](#semantic-id静态产物与导入)
+- [Semantic ID：静态产物与碰撞语义](#semantic-id静态产物与碰撞语义)
 - [换数据集 / 换 backbone](#换数据集--换-backbone)
 - [代码结构](#代码结构)
 - [与原文的差异](#与原文的差异)
@@ -37,19 +67,22 @@
 LLM 直接生成物品的 Semantic ID token 序列，约束 beam 解码保证每条 beam 都是
 合法且唯一的物品。三阶段：**SID 构建 → SFT → GRPO**。
 
-| 项 | 原文 | 我们 |
-|---|---|---|
-| SID | 冻结 text encoder + **3 层 RQ-VAE**；token 形如 `<a_12><b_200><c_7>` | 一致（另提供 RQ-Kmeans 分支可切换） |
-| SFT | **全参微调**（`sft.py` 里连 `import peft` 都没有），只有一个 `freeze_LLM` 开关 | 一致 |
-| SFT 任务 | 多任务混合：序列推荐 + title→sid + sid→title | 一致 |
-| RL | GRPO，`num_generations=16`、`beta=1e-3`、`lr=1e-5`、`beam_search=True` | 一致 |
-| reward | `reward_type=ranking` = `rule_reward`（命中=1）+ `ndcg_rule_reward`（组内位次 `1/log2(i+2)`） | 逐行对齐 |
-| 解码 | `LogitProcessor.py` 的前缀树约束，非法 SID 率恒为 0 | 一致 |
-| 数据 | Amazon Reviews 2014/2018/2023 | Amazon23 |
+| 项 | 原文 | `mode: reproduction` | `mode: integrated` |
+|---|---|---|---|
+| SID | 冻结 text encoder + **官方 3 层 RQ-VAE**（无 PCA；layers=`[2048..64]`；`e_dim=32`；codebook=`[256,256,256]`）；token `<a_12><b_200><c_7>` | 官方 RQ-VAE 移植 + Sinkhorn 冲突消解 | 简化 RQ-VAE（可 PCA）或 RQ-Kmeans |
+| 碰撞 | 原始碰撞 → 冲突组 Sinkhorn 重分配（最多 20 轮）；**不要求最终碰撞率恒为 0** | 同左；仅 `strict_unique` 才硬失败 | 同左；512 codebook 等为实验变体 |
+| SFT | **全参**：`ConcatDataset(SidSFT, SidItemFeat, FusionSeqRec)`；lr=`3e-4`；epochs=`10`；linear + warmup_steps=`20`；eval/save=`0.05`；`load_best_model_at_end`；left padding；raw tokenization（不走 chat template） | 对齐上游目标/超参/tokenization；micro-batch 可按显存下调 | 模块化 `seqrec` + `title2sid`/`sid2title`（chat template） |
+| RL | GRPO，`num_generations=16`、`beta=1e-3`、`lr=1e-5`、cosine warmup、`beam_search` + **`do_sample=True`**、`sync_ref_model` | 对齐 | 对齐（可改采样） |
+| reward | `ranking` = rule + ndcg_rule（目标文本精确匹配；无 −1 invalid） | 对齐（`implementation: minionerec_reference`） | 对齐 |
+| 解码 | 前缀树约束 beam | 对齐；SID 碰撞确定性解码 | 对齐 |
+| 数据 | Amazon Reviews 2014/2018/2023 | Amazon23 | Amazon23 |
+| Reference pin | — | `reference.commit=0c64b955…`（写入 manifest） | — |
 
 ### 路线 2 — Rec-R1（检索 query 生成）
 
 > 原文：[linjc16/Rec-R1](https://github.com/linjc16/Rec-R1)
+
+**本仓库实现是 Rec-R1-style / paper-faithful integrated reimplementation**（自定义 GRPO + HF generate + Python BM25 + 统一 RuntimeContext）。**不是**官方 `verl` + FSDP + vLLM 执行栈的逐行复现；若需要严格官方栈，应作为可选独立 backend，而不是阻塞当前研究框架。
 
 LLM 不直接输出物品，而是生成一条**检索 query**，交给检索器执行，检索指标直接当
 reward。**原文没有 SFT 阶段**，直接从 instruct 模型开始 RL。
@@ -58,9 +91,9 @@ reward。**原文没有 SFT 阶段**，直接从 instruct 模型开始 RL。
 > 但训练脚本 `scripts/train/train_rec-amazon_c4_3b.sh` 里写的是
 > `algorithm.adv_estimator=grpo`，没有 critic。
 
-| 项 | 原文 | 我们 |
+| 项 | 原文 | 我们（integrated reimplementation） |
 |---|---|---|
-| 算法 | GRPO（基于 verl），`rollout.n=12`、`temperature=0.6`、`top_p=0.95`、`kl_loss_coef=0.001`、`low_var_kl`、`lr=1e-6` | 一致（自己实现，不依赖 verl） |
+| 算法 | GRPO（基于 verl），`rollout.n=12`、`temperature=0.6`、`top_p=0.95`、`kl_loss_coef=0.001`、`low_var_kl`、`lr=1e-6` | 数学对齐；执行栈为自定义 GRPO（不依赖 verl） |
 | 输出格式 | `<think>…</think><answer>{"query": "…"}</answer>`，answer 必须是含 `query` 键的合法 JSON | 一致 |
 | 检索 | Pyserini / Lucene 多字段 BM25 | **纯 Python BM25**（支持 `NOT "…" AND …` 布尔语法）；`kind: lucene` 可切回 |
 | reward | format ±0.1/−2 + NDCG@1000（训练）/ @100（验证），检索异常 −2 | 逐行对齐 `verl/utils/reward_score/amazon_c4.py` |
@@ -93,6 +126,98 @@ for iteration in 1..T:                      # 论文实测 T=2 最好，T=3 因�
 | 数据 | ML-1M / Amazon-Books / Amazon-Beauty | Amazon23（ML-1M 适配器也提供，见「换数据集」） |
 
 ---
+
+
+### Runtime wiring (devices / precision / strategy / memory)
+
+```bash
+GPUS=auto bash run.sh          # use all visible GPUs
+GPUS=0 bash run.sh             # single GPU
+GPUS=0,2 bash run.sh           # explicit subset
+
+# hardware.precision=auto  → BF16 (cc>=8) / FP16 AMP / FP32
+# hardware.strategy=auto   → single | ddp | fsdp (wired via RuntimeContext.wrap_model)
+# hardware.memory=auto     → preserve global_batch_size while tuning micro-batch
+# optimization.compile     → torch.compile / Inductor (off by default in reproduction)
+```
+
+NCCL P2P/IB are **not** disabled by default. Troubleshooting: `LLM4REC_NCCL_COMPAT=1`.
+
+## Reproduction Mode vs Integrated Research Mode
+
+```bash
+# Reproduction（MiniOneRec 官方 SID / 超参）
+EXP=minionerec_reproduction_qwen05b GPUS=0 bash run.sh mode=reproduction \
+  hardware.devices=auto hardware.precision=auto hardware.strategy=auto
+
+# Integrated（统一研究设定）
+EXP=minionerec_qwen05b_amazon GPUS=0,1,2,3 bash run.sh mode=integrated
+EXP=recr1_qwen05b_amazon GPUS=0 bash run.sh mode=integrated
+EXP=dpo4rec_qwen05b_amazon GPUS=0 bash run.sh mode=integrated
+```
+
+| | Reproduction | Integrated |
+|---|---|---|
+| MiniOneRec SID | 官方 RQ-VAE，**无 PCA**，codebook 256 | 简化 RQ-VAE（可 PCA）/ RQ-Kmeans |
+| Rec-R1 stages | 默认不强制额外 SFT | 常含 SFT 以对齐三条路线基线 |
+| DPO4Rec | 论文级超参；实现细节有假设处会注明 | 同上 + 统一 backbone/数据 |
+| 碰撞率 = 0 | **不是**硬性前提 | 同左 |
+| codebook 512 | 实验变体，非默认 | 实验变体 |
+
+## 硬件兼容性
+
+Runtime 用 PyTorch capability API 选精度/策略，**不按 GPU 商品名写死分支**。
+
+| GPU | Preferred precision | Supported |
+|---|---|---|
+| V100 | FP16 AMP / FP32（MiniOneRec SID SFT 默认 FP32） | yes |
+| A100 | BF16 | yes |
+| H200 | BF16 | yes |
+| B100 | BF16 | yes |
+
+FP8 永不自动开启。吞吐量不保证跨硬件一致。多卡默认启用 NCCL 拓扑检测；排查问题时：
+
+```bash
+LLM4REC_NCCL_COMPAT=1 bash run.sh
+```
+
+`global_batch_size`（alias `target_global_batch_size`）会随 `world_size` 重算
+`gradient_accumulation_steps`。默认 `hardware.batch_policy.preserve_global_batch: best_effort`：
+允许小幅相对偏差并写入日志；`strict` 才会在偏差超限时失败。
+
+### Reproduction vs hardware-equivalent execution
+
+| Layer | Reproduction preserves | May adapt across GPUs |
+|---|---|---|
+| Algorithm | SID recipe, reward/loss math, GRPO/DPO, sampling temperature/top-p/beams, eval | — |
+| Hardware | — | micro-batch, grad accum, precision, strategy (DDP/FSDP), activation checkpointing, compile, attention backend, pad_to_multiple_of |
+
+Each run writes `execution_manifest.yaml` with **algorithm** knobs vs **actual_execution**
+(resolved/effective strategy, batch deviation, compile status, peak VRAM).
+
+### Feature honesty labels
+
+| Feature | Status |
+|---|---|
+| Soft global-batch `best_effort` | **implemented** |
+| MiniOneRec reproduction SFT (SidSFT+SidItemFeat+FusionSeqRec; raw tokenization; left pad) | **implemented** |
+| GRPO true B×G scoring + within-prompt advantages | **implemented** |
+| GRPO LR scheduler + warmup (optimizer steps) | **implemented** |
+| Constrained beam `do_sample` (reproduction True) | **implemented** |
+| DPO true 2B preference minibatch | **implemented** |
+| `sync_ref_model` TR-DPO mixup (α=0.6 / every 512) | **implemented** |
+| Strategy requested/resolved/effective + DeepSpeed honesty for custom loops | **implemented** |
+| FSDP wrap → optimizer → full-state save; precision from RuntimeContext | **implemented** |
+| `memory:auto` (GRPO + SFT, representative shapes) | **implemented** |
+| Attention `sdpa` + eager fallback | **implemented** |
+| Length bucketing | **experimental_inactive** (`LengthBucketBatchSampler` present; not wired; use HF `group_by_length`) |
+| Static KV cache | **experimental** (Rec-R1 opt-in; MiniOneRec constrained gen stays dynamic; fallback updates effective) |
+| SID token init | **reference** resize-only in reproduction; optional `mean_noise` for integrated |
+| Multi-GPU validation | `scripts/validate_multi_gpu.sh` + `scripts/validate_runtime_matrix.py` |
+| MiniOneRec reference reward (rule + ndcg_rule; target text; no −1 invalid) | **implemented** |
+| Reference pin (`reference.commit` → `execution_manifest`) | **implemented** |
+| Triton RQ distance+argmin | **optional / not justified** — see `benchmarks/bench_rq_quantization.py` |
+| Rec-R1 official verl/vLLM stack | **not implemented** (integrated reimplementation only) |
 
 ## 框架是怎么统一的
 
@@ -298,6 +423,7 @@ train:
 ```
 runs/<数据集>/<route>/<模型>/seed_<seed>/<时间戳>/
 ├── resolved_config.json    这次跑用的完整配置 —— 拿它就能复现
+├── execution_manifest.yaml algorithm vs actual_execution（batch/strategy/compile/VRAM）
 ├── environment.json        git commit / 依赖版本 / 硬件
 ├── metrics.jsonl           全部指标（wandb 挂了也不丢）
 ├── summary.json            各 stage 的 checkpoint 路径 + 最终指标
@@ -410,7 +536,35 @@ DEEPSPEED=zero2 GPUS=0,1,2,3 bash run.sh    # SFT 用 ZeRO-2
 
 ---
 
-## Semantic ID：静态产物与导入
+## Semantic ID：静态产物与碰撞语义
+
+### 碰撞语义（MiniOneRec）
+
+官方流程：
+
+```text
+initial RQ-VAE encoding
+  → detect collision groups
+  → re-encode only conflicting groups (last-level Sinkhorn)
+  → retry up to 20 iterations
+  → save final SID mapping
+```
+
+显式指标：`raw_collision_rate`、`post_resolution_collision_rate`、
+`num_collision_groups`、`max_collision_group_size`、
+`duplicate_item_collision_rate`、`quantization_collision_rate`。
+
+- 原始碰撞会被测量并写入 `build_stats.json`
+- 会做冲突消解，但**最终碰撞率不必为 0**（目录重复商品等）
+- `sid.strict_unique: true` 才会因残留碰撞硬失败
+- codebook `[512,512,512]` / constrained RQ-kmeans 是**实验配置**，不是 reproduction 默认修复
+- Triton RQ `distance+argmin`：短 profile / `benchmarks/bench_rq_quantization.py` 显示
+  开销相对 RQ-VAE 训练 / LLM forward **不构成热点** → 保持 `backend=reference`
+  （placeholder 不是真 Triton；**custom Triton not justified by profiling**）
+
+反向映射使用 `sid_to_items: dict[SID, list[ItemId]]`，评测需要唯一 item 时做确定性解析并记录歧义，绝不静默覆盖。
+
+
 
 SID 是**静态产物**，只由 `prepare.sh` 生成一次，训练与评测全程**只读**：
 

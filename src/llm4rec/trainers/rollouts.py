@@ -22,14 +22,27 @@ def _encode(tokenizer: Any, prompt: Any) -> torch.Tensor:
 class ConstrainedBeamRollout:
     """MiniOneRec：约束 beam 采样（官方 ``--beam_search True``）。
 
-    每条 beam 都走全库 SID 前缀树，所以采样出来的 G 条**全是合法且互不相同**
-    的 SID。这一点对 reward 很关键：官方的 ndcg_rule_reward 是按组内次序给
-    位次奖励的，前提就是这一组本身是一个有序的候选列表。
+    Upstream ``GenerationConfig`` uses ``do_sample=True``, ``temperature=1.0``,
+    ``num_beams=num_generations``, ``num_return_sequences=num_generations``.
+    Reproduction must not force deterministic ``do_sample=False``.
     """
 
-    def __init__(self, sid_table: Any, *, max_new_tokens: int | None = None) -> None:
+    def __init__(
+        self,
+        sid_table: Any,
+        *,
+        max_new_tokens: int | None = None,
+        do_sample: bool = True,
+        temperature: float = 1.0,
+        length_penalty: float = 0.0,
+        beam_search: bool = True,
+    ) -> None:
         self.table = sid_table
         self.max_new_tokens = int(max_new_tokens or sid_table.levels + 2)
+        self.do_sample = bool(do_sample)
+        self.temperature = float(temperature)
+        self.length_penalty = float(length_penalty)
+        self.beam_search = bool(beam_search)
 
     @torch.no_grad()
     def __call__(
@@ -40,18 +53,35 @@ class ConstrainedBeamRollout:
         eos = tokenizer.eos_token_id
         prompt_len = prompt_ids.shape[0]
 
-        output = model.generate(
-            prompt_ids.unsqueeze(0),
-            max_new_tokens=self.max_new_tokens,
-            num_beams=group_size,
-            num_return_sequences=group_size,
-            prefix_allowed_tokens_fn=self.table.prefix_allowed_fn(
+        gen_kwargs: dict[str, Any] = {
+            "max_new_tokens": self.max_new_tokens,
+            "num_return_sequences": group_size,
+            "prefix_allowed_tokens_fn": self.table.prefix_allowed_fn(
                 tokenizer, prompt_len, eos
             ),
-            do_sample=False,
-            early_stopping=True,
-            pad_token_id=eos,
-        )
+            "pad_token_id": eos,
+        }
+        if self.beam_search:
+            gen_kwargs.update(
+                {
+                    "num_beams": group_size,
+                    "do_sample": self.do_sample,
+                    "temperature": self.temperature if self.do_sample else None,
+                    "length_penalty": self.length_penalty,
+                    "early_stopping": True,
+                }
+            )
+            if not self.do_sample:
+                gen_kwargs.pop("temperature", None)
+        else:
+            gen_kwargs.update(
+                {
+                    "do_sample": True,
+                    "temperature": self.temperature,
+                }
+            )
+
+        output = model.generate(prompt_ids.unsqueeze(0), **gen_kwargs)
 
         completions, texts = [], []
         for sequence in output:
@@ -77,10 +107,18 @@ class SamplingRollout:
         temperature: float = 0.6,
         top_p: float = 0.95,
         max_new_tokens: int = 512,
+        use_cache: bool = True,
+        cache_implementation: str | None = None,
+        kv_choice: Any = None,
+        cfg: dict[str, Any] | None = None,
     ) -> None:
         self.temperature = float(temperature)
         self.top_p = float(top_p)
         self.max_new_tokens = int(max_new_tokens)
+        self.use_cache = bool(use_cache)
+        self.cache_implementation = cache_implementation
+        self.kv_choice = kv_choice
+        self.cfg = cfg
 
     @torch.no_grad()
     def __call__(
@@ -88,33 +126,41 @@ class SamplingRollout:
     ) -> Rollout:
         device = next(model.parameters()).device
         prompt_ids = _encode(tokenizer, example["prompt"]).to(device)
-        prompt_len = prompt_ids.shape[0]
         eos = tokenizer.eos_token_id
-        pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos
+        prompt_len = prompt_ids.shape[0]
+        gen_kwargs: dict[str, Any] = {
+            "max_new_tokens": self.max_new_tokens,
+            "num_return_sequences": group_size,
+            "do_sample": True,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "pad_token_id": eos,
+            "use_cache": self.use_cache,
+        }
+        if self.cache_implementation:
+            gen_kwargs["cache_implementation"] = self.cache_implementation
+        try:
+            output = model.generate(prompt_ids.unsqueeze(0), **gen_kwargs)
+        except Exception as exc:
+            # Fall back to dynamic if static cache unsupported
+            gen_kwargs.pop("cache_implementation", None)
+            gen_kwargs["use_cache"] = True
+            if self.kv_choice is not None and hasattr(self.kv_choice, "fallback_to_dynamic"):
+                self.kv_choice.fallback_to_dynamic(str(exc))
+                self.cache_implementation = None
+                if self.cfg is not None:
+                    from llm4rec.runtime.kv_cache import persist_kv_choice
 
-        output = model.generate(
-            prompt_ids.unsqueeze(0),
-            max_new_tokens=self.max_new_tokens,
-            num_return_sequences=group_size,
-            do_sample=True,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            pad_token_id=pad,
-        )
-
+                    persist_kv_choice(self.cfg, self.kv_choice)
+            output = model.generate(prompt_ids.unsqueeze(0), **gen_kwargs)
         completions, texts = [], []
         for sequence in output:
             comp = sequence[prompt_len:]
-            if pad is not None:
-                # 去掉尾部 padding，但保留中间可能出现的同 id token
-                nonpad = (comp != pad).nonzero()
-                if nonpad.numel():
-                    comp = comp[: int(nonpad[-1]) + 1]
-                else:
-                    comp = comp[:0]
+            if eos is not None:
+                nonpad = (comp != eos).nonzero()
+                comp = comp[: int(nonpad[-1]) + 1] if nonpad.numel() else comp[:0]
             completions.append(comp)
             texts.append(tokenizer.decode(comp, skip_special_tokens=True))
-
         return Rollout(
             prompt_ids=prompt_ids,
             completion_ids=completions,

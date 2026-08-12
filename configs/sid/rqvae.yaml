@@ -1,23 +1,25 @@
 # =============================================================================
-# Semantic ID 构建 — RQ-VAE（对齐官方 MiniOneRec：冻结 text encoder + 3 层 RQ-VAE）
+# Semantic ID — single source of truth for the integrated profile.
 #
-# ★ SID 是【静态产物】。跑一次：
-#     python -m llm4rec.cli.main build-sid --config configs/exp/minionerec.yaml
-#   产物落在 artifacts/sid/<dataset>/<config_hash>/，训练与评测【只读】。
-#   启动时校验 manifest hash，对不上直接报错退出，绝不隐式重建。
+# Do NOT restate codebook_size / rqvae / encoder in route or exp YAMLs.
+# Override only via CLI (e.g. sid.codebook_size=256) or a dedicated exp variant.
+#
+# MiniOneRec reproduction (codebooks=[256,256,256], no PCA, official layers)
+# lives in route/minionerec/reproduction.yaml and is forced again by modes.py.
 # =============================================================================
 
 sid:
   method: rqvae                 # rqvae | rqkmeans
-  # 注意：mor-reproduce 实测在 Amazon23 Industrial 上 RQ-VAE 的碰撞率高于
-  # residual-kmeans，所以它默认切到了 rqkmeans。这里按官方设定用 rqvae，
-  # 但保留 rqkmeans 可切换，且构建后会强制报告碰撞率。
+  implementation: integrated    # integrated | minionerec_reference
   levels: 3
   codebook_size: 512
-  layer_prefixes: [a, b, c]     # SID token 形如 <a_12><b_200><c_7>
+  layer_prefixes: [a, b, c]
+  # Soft threshold only when >0 and <1. Zero collision is NOT required unless
+  # sid.strict_unique: true
   max_collision_rate: 1.0
+  strict_unique: false
+  collision_handling: sinkhorn_last_level
 
-  # —— 物品文本编码（冻结）——
   encoder:
     model: Qwen/Qwen3-Embedding-4B
     local_path: data/models/Qwen3-Embedding-4B
@@ -27,37 +29,28 @@ sid:
     dtype: fp16
     device: cuda:0
 
-  # —— RQ-VAE 训练（对齐官方 MiniOneRec）——
+  # —— Integrated / simplified RQ-VAE ——
   rqvae:
-    pca_dim: 512                # RQ 之前先 PCA 降维
+    pca_dim: 512                # ignored in MiniOneRec reproduction
     latent_dim: 64
     hidden_dim: 512
-    beta: 0.25                  # commitment loss 权重
+    beta: 0.25
     epochs: 2000
     batch_size: 2048
     lr: 3.0e-4
-    warm_start_size: 8192       # KMeans warm-start 采样数
-    kmeans_init: true           # 官方 kmeans_init=True
+    warm_start_size: 8192
+    kmeans_init: true
     kmeans_iters: 100
-    dead_code_every: 100        # 每 N epoch 用高残差样本重置死码
+    dead_code_every: 100
     log_every: 50
     early_collision_patience: 40
-    # 官方 generate_indices.py 冲突后处理
     sk_iters: 50
-    sk_epsilon_last: 0.003      # 只在最后一层开 Sinkhorn
-    collision_retry_iters: 20   # 最多重试轮数
+    sk_epsilon_last: 0.003
+    collision_retry_iters: 20
 
-  # —— rqkmeans 分支（method: rqkmeans 时生效）——
   rqkmeans:
     pca_dim: 256
-    enforce_unique: true        # 在每个 (c0,c1) 前缀内重排 c2，把碰撞压到 ~0
+    enforce_unique: true
 
-  # ★ 导入现成的 SID：填一个目录路径，跳过本机构建。
-  #   典型用法：在有 GPU 的机器上建好一次（RQ-VAE 要跑几十分钟），
-  #   把 artifacts/sid/<dataset>/<hash>/ 整个目录拷到别的机器，这里一指就能用。
-  #   导入的产物照样校验物品指纹，对不上会报错，不会静默用错表。
-  #   留空 = 按配置 hash 在 artifacts_root 下查找。
-  #   命令行也行：bash run.sh sid.import_from=/data/shared/sid/amazon23_ind
   import_from: null
-
   artifacts_root: artifacts/sid

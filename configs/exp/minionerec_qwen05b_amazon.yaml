@@ -1,8 +1,9 @@
 # =============================================================================
 # 主实验配置：MiniOneRec × Qwen2.5-0.5B-Instruct × Amazon Reviews 2023
 #
-# 这是给训练同学的**默认起跑配置**。全部参数都摊在这个文件里（不靠 defaults
-# 层里的隐式默认值），改哪个一目了然。
+# 默认起跑配置。SID 算法参数只在 configs/sid/rqvae.yaml；本文件只写实验差异项
+# （数据类目 / 训练超参 / wandb）。改 codebook_size 请改 sid/rqvae.yaml，或：
+#     bash prepare.sh sid.codebook_size=256
 #
 # 跑法：
 #     bash prepare.sh EXP=minionerec_qwen05b_amazon    # 下载 → 预处理 → SID（跑一次）
@@ -18,12 +19,15 @@ defaults:
   - base
   - data/amazon23
   - model/qwen2.5-0.5b-instruct
+  - route/minionerec/common
+  - route/minionerec/integrated
   - sid/rqvae
   - bias/default
 
 experiment:
   name: minionerec_qwen05b_amazon
   route: minionerec
+  mode: integrated          # integrated | reproduction
 
 seed: 42
 
@@ -43,35 +47,13 @@ data:
 
 # ──────────────────────────── 硬件 ────────────────────────────
 hardware:
-  devices: "0,1,2,3"       # run.sh 的 GPUS 会覆盖
-  # V100 没 bf16；且 mor-reproduce 实测 fp16 下 SID SFT（新增 embedding）会发散。
-  # A100/H100 改成 bf16，能省一半显存、快约 1.5 倍。
-  precision: fp32
+  devices: auto
+  precision: auto
+  strategy: auto
+  memory: auto
   gradient_checkpointing: true
   # 0.5B 全参单卡放得下，DDP 就够，不必上 DeepSpeed。
-  # 换 3B 时改成 zero2；7B 用 zero3。
   deepspeed: null
-
-# ───────────────────────── Semantic ID ─────────────────────────
-sid:
-  method: rqvae            # 官方设定。碰撞率下不去就换 rqkmeans
-  levels: 3
-  codebook_size: 256
-  max_collision_rate: 0.0  # 有碰撞直接失败，不带着脏 SID 训练
-  encoder:
-    model: Qwen/Qwen3-Embedding-4B
-    local_path: data/models/Qwen3-Embedding-4B
-    batch_size: 4
-    max_length: 1024
-    dtype: fp16
-    device: cuda:0
-
-# ─────────────────────────── 解码器 ───────────────────────────
-decoder:
-  name: constrained_beam
-  num_beams: 20            # 要评 top-20 就至少 20
-  max_new_tokens: 8
-  fail_on_invalid: true
 
 # ─────────────────────────── 训练 ───────────────────────────
 train:
@@ -92,15 +74,15 @@ train:
     max_grad_norm: 1.0
 
     # 官方 sft.sh 是 8 卡 × micro 16 = 全局 1024。
-    # 这里 4 卡 × 2 × 8 = 全局 64（0.5B + fp32 的显存现实）。
-    # 想复现官方全局 batch：把 gradient_accumulation_steps 提到 128。
+    # 设 global_batch_size 后，换卡数会自动重算 gradient_accumulation_steps。
+    global_batch_size: 64
     per_device_batch_size: 2
     gradient_accumulation_steps: 8
     max_seq_length: 512
 
     logging_steps: 10
     eval_steps: 200                # 每 200 step 在 val 上算 loss
-    load_best_model_at_end: false  # 需要 checkpoint.save_steps 非 null 才生效
+    load_best_model_at_end: false  # true 时需要 checkpoint.save_steps 已开启
     early_stopping_patience: null
 
   # ---------------------------------------------------------------- RL
@@ -127,6 +109,7 @@ train:
 
     per_device_batch_size: 1
     gradient_accumulation_steps: 8
+    global_batch_size: 8       # 保持跨卡数一致的有效全局 batch
     max_prompt_length: 512
 
     grpo:
@@ -157,8 +140,8 @@ bias:
 # ──────────────────────── checkpoint ────────────────────────
 checkpoint:
   save_stage_final: true    # 每个 stage 结束存一份完整权重
-  save_steps: null          # 训练中不存中间 checkpoint（0.5B 全参一份 ~2GB）
-  save_total_limit: 1
+  save_steps: 500           # 训练中每隔 N step 存中间 checkpoint（null 关闭）
+  save_total_limit: 3
   save_optimizer_state: false
 
 # ─────────────────────────── wandb ───────────────────────────

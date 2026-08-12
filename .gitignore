@@ -9,6 +9,8 @@ build/
 .ruff_cache/
 .mypy_cache/
 .coverage
+htmlcov/
+*.egg
 
 # 虚拟环境
 .venv/
@@ -19,6 +21,9 @@ venv/
 # OS / 编辑器
 .DS_Store
 .ipynb_checkpoints/
+.cursor/
+*.swp
+*.swo
 
 # —— 数据与产物（都很大，不进 git）——
 data/raw/**
@@ -27,25 +32,42 @@ data/processed/**
 !data/processed/.gitkeep
 data/models/**
 !data/models/.gitkeep
+data/cache/**
 
 # artifacts/ 里的 SID 产物值得单独打包分发（见 README「SID 导入」），
-# 但不适合进 git —— codebook.pt 几十 MB
+# 但不适合进 git —— codebook.pt / embedding 可达数百 MB
 artifacts/**
 !artifacts/.gitkeep
 
-# 训练输出
+# 训练输出 / 日志 / 中间产物
 runs/**
 !runs/.gitkeep
 logs/**
 !logs/.gitkeep
+*.log
+profiler/
+outputs/
+tmp/
+temp/
 
 # wandb 本地缓存
 wandb/
+**/wandb/
 
-# 模型权重
+# 模型权重与数值缓存
 *.pt
 *.bin
 *.ckpt
 *.safetensors
 *.npy
+*.npz
 *.pkl
+*.h5
+*.onnx
+*.gguf
+*.parquet
+
+# HF / torch 本地缓存（若误落在仓库内）
+.cache/
+**/huggingface/
+**/transformers/cache/

@@ -45,6 +45,7 @@ class StageContext:
     checkpoint: str | None = None
     summaries: dict[str, Any] = field(default_factory=dict)
     eval_history: list[dict[str, Any]] = field(default_factory=list)
+    runtime: Any = None
 
 
 class OnlineEvalHook:
@@ -113,6 +114,7 @@ class Pipeline:
         self.cfg = cfg
         self.run_dir = Path(run_dir)
         self.logger = logger
+        self.runtime = None
 
     # ---------------------------------------------------------- 需要子类实现
     def build_decoder(self, ctx: StageContext) -> Any:
@@ -187,7 +189,11 @@ class Pipeline:
         # torchrun 下初始化进程组。SFT 走 HF Trainer（它自己也会初始化，幂等），
         # RL/DPO 是手写循环，必须靠这里。
         dist_utils.init_process_group()
+        from llm4rec.runtime.context import build_runtime
+
+        self.runtime = build_runtime(self.cfg, log=self.logger.info)
         if dist_utils.is_distributed():
+            dist_utils.print_distributed_banner(self.logger.info)
             self.logger.info(f"[run] {dist_utils.summary_line()}")
         ctx = self.build_context()
         resume = self.cfg.get("resume_from")
@@ -213,34 +219,113 @@ class Pipeline:
                 ctx.summaries[tag] = self.run_eval(ctx, tag=tag)
             else:
                 raise ConfigurationError(f"未知 stage '{stage}'")
+            # Ensure all ranks finish the stage (esp. rank0 checkpoint writes)
+            # before the next stage loads weights.
+            dist_utils.barrier(f"stage_done_{stage}")
 
         self._write_summary(ctx)
+        if dist_utils.is_main():
+            from llm4rec.runtime.manifest import build_execution_manifest, write_execution_manifest
+            from llm4rec.runtime.profiler import peak_vram_gb
+
+            batch_plans = {}
+            for stage, payload in ctx.summaries.items():
+                if isinstance(payload, dict) and "batch_plan" in payload:
+                    batch_plans[stage] = payload["batch_plan"]
+                if isinstance(payload, dict) and isinstance(payload.get("performance"), dict):
+                    key = "grpo" if stage == "rl" else stage
+                    self.cfg.setdefault("_performance", {}).setdefault(key, {}).update(
+                        payload["performance"]
+                    )
+            manifest = build_execution_manifest(
+                self.cfg,
+                runtime=self.runtime,
+                batch_plans=batch_plans,
+                throughput={"peak_vram_gb": peak_vram_gb()},
+            )
+            path = write_execution_manifest(self.run_dir / "execution_manifest.yaml", manifest)
+            self.logger.info(f"[run] execution_manifest → {path}")
         dist_utils.barrier("run_end")
         dist_utils.cleanup()
         return ctx.summaries
 
     # ------------------------------------------------------------------ SFT
     def run_sft(self, ctx: StageContext) -> dict[str, Any]:
+        from llm4rec.core.modes import get_mode
         from llm4rec.trainers.sft import run_sft
 
         model, tokenizer = self.load_model(ctx)
-        tasks = list(((self.cfg["train"].get("sft") or {}).get("tasks")) or [])
-        train = list(ctx.train_examples)
-        if ctx.sid_table is not None and ({"title2sid", "sid2title"} & set(tasks)):
-            aux = build_auxiliary_examples(
-                sid_table=ctx.sid_table, meta=ctx.meta, tasks=tasks
+        sft_cfg = (self.cfg.get("train") or {}).get("sft") or {}
+        mode = get_mode(self.cfg)
+
+        # MiniOneRec reproduction: SidSFT + SidItemFeat + FusionSeqRec (upstream).
+        if (
+            mode == "reproduction"
+            and self.route == "minionerec"
+            and ctx.sid_table is not None
+        ):
+            from llm4rec.data.minionerec_sft import build_sft_rows, sft_dataset_counts
+
+            objectives = list(
+                sft_cfg.get("objectives")
+                or ["sid_sft", "sid_item_feat", "fusion_seqrec"]
             )
-            self.logger.info(f"[sft] 辅助任务样本 {len(aux)}（title2sid / sid2title）")
-            train = train + aux
+            # Do NOT collapse by user: keep every sliding window row.
+            train_rows = [
+                {
+                    "user_id": str(ex.get("user_id") or ""),
+                    "history": list(ex.get("history") or []),
+                    "target_item": ex.get("target_item"),
+                }
+                for ex in ctx.train_examples
+                if ex.get("history") and ex.get("target_item")
+            ]
+            train = build_sft_rows(
+                train_rows=train_rows,
+                sid_table=ctx.sid_table,
+                meta=ctx.meta,
+                objectives=objectives,
+            )
+            counts = sft_dataset_counts(train)
+            self.logger.info(
+                f"[sft] MiniOneRec reproduction objectives={objectives} counts={counts}"
+            )
+            ctx.summaries.setdefault("sft_dataset_counts", counts)
+            eval_rows = [
+                {
+                    "user_id": str(ex.get("user_id") or ""),
+                    "history": list(ex.get("history") or []),
+                    "target_item": ex.get("target_item"),
+                }
+                for ex in ctx.val_examples
+                if ex.get("history") and ex.get("target_item")
+            ]
+            eval_examples = build_sft_rows(
+                train_rows=eval_rows,
+                sid_table=ctx.sid_table,
+                meta=ctx.meta,
+                objectives=["sid_sft"],
+            )
+        else:
+            tasks = list(sft_cfg.get("tasks") or [])
+            train = list(ctx.train_examples)
+            if ctx.sid_table is not None and ({"title2sid", "sid2title"} & set(tasks)):
+                aux = build_auxiliary_examples(
+                    sid_table=ctx.sid_table, meta=ctx.meta, tasks=tasks
+                )
+                self.logger.info(f"[sft] 辅助任务样本 {len(aux)}（title2sid / sid2title）")
+                train = train + aux
+            eval_examples = ctx.val_examples
 
         summary = run_sft(
             cfg=self.cfg,
             model=model,
             tokenizer=tokenizer,
             train_examples=train,
-            eval_examples=ctx.val_examples,
+            eval_examples=eval_examples,
             output_dir=self.run_dir / "sft",
             logger=self.logger,
+            runtime=self.runtime,
         )
         ctx.checkpoint = summary["checkpoint"]
         del model
@@ -249,10 +334,40 @@ class Pipeline:
 
     # ------------------------------------------------------------------- RL
     def run_rl(self, ctx: StageContext) -> dict[str, Any]:
+        from llm4rec.core.modes import get_mode
         from llm4rec.trainers.grpo import run_grpo
 
         model, tokenizer = self.load_model(ctx)
         ref_model, _ = self.load_model(ctx, frozen=True)
+
+        rl_examples = ctx.train_examples
+        mode = get_mode(self.cfg)
+        if mode == "reproduction" and self.route == "minionerec" and ctx.sid_table is not None:
+            from llm4rec.data.minionerec_rl import (
+                build_minionerec_reproduction_rl_train,
+                rl_dataset_counts,
+            )
+
+            rl_cfg = (self.cfg.get("train") or {}).get("rl") or {}
+            rl_rows = [
+                {
+                    "user_id": str(ex.get("user_id") or ""),
+                    "history": list(ex.get("history") or []),
+                    "target_item": ex.get("target_item"),
+                }
+                for ex in ctx.train_examples
+                if ex.get("history") and ex.get("target_item")
+            ]
+            rl_examples = build_minionerec_reproduction_rl_train(
+                train_rows=rl_rows,
+                sid_table=ctx.sid_table,
+                meta=ctx.meta,
+                datasets=rl_cfg.get("reference_datasets"),
+                seed=int(self.cfg.get("seed") or 42),
+            )
+            counts = rl_dataset_counts(rl_examples)
+            self.logger.info(f"[rl] MiniOneRec reproduction RL counts={counts}")
+            ctx.summaries.setdefault("rl_dataset_counts", counts)
 
         hook = self._build_online_hook(ctx, model, tokenizer, stage="rl")
         summary = run_grpo(
@@ -260,13 +375,14 @@ class Pipeline:
             model=model,
             ref_model=ref_model,
             tokenizer=tokenizer,
-            train_examples=ctx.train_examples,
+            train_examples=rl_examples,
             rollout_fn=self.build_rollout(ctx),
             reward_fn=self.build_reward(ctx),
             output_dir=self.run_dir / "rl",
             logger=self.logger,
             callbacks=[hook] if hook else [],
             stage="rl",
+            runtime=self.runtime,
         )
         if hook:
             summary["bias_curve"] = hook.history
@@ -296,9 +412,10 @@ class Pipeline:
         # 多卡：各 rank 解码一片再汇总。让 rank0 独自跑完全量的话，
         # 其它 rank 会干等在下一个 barrier 上，长时间看起来像卡死。
         shard = dist_utils.shard(examples)
-        self.logger.info(
-            f"[{tag}] 评测 {len(examples)} 条（本 rank {len(shard)}），top_k={top_k}"
-        )
+        if dist_utils.is_main():
+            self.logger.info(
+                f"[{tag}] 评测 {len(examples)} 条（每 rank ≈{len(shard)}），top_k={top_k}"
+            )
         local = decoder.decode_batch(model, tokenizer, shard, top_k=top_k)
         results = [r for bucket in dist_utils.all_gather_object(local) for r in (bucket or [])]
         metrics = compute_bias_metrics(
@@ -434,12 +551,29 @@ class MiniOneRecPipeline(Pipeline):
     def load_model(self, ctx: StageContext, *, frozen: bool = False) -> tuple[Any, Any]:
         from llm4rec.sid.model import load_for_sid, load_trained
 
+        runtime = self.runtime or ctx.runtime
+        attn = runtime.attention_implementation() if runtime is not None else None
+        lr = dist_utils.local_rank()
         if ctx.checkpoint:
             bundle = load_trained(
-                ctx.checkpoint, dtype=str(self.cfg["hardware"].get("precision") or "fp32")
+                ctx.checkpoint,
+                dtype=str(self.cfg["hardware"].get("precision") or "fp32"),
+                local_rank=lr,
+                attn_implementation=attn,
             )
         else:
-            bundle = load_for_sid(self.cfg["model"], ctx.sid_table)
+            model_cfg = dict(self.cfg["model"])
+            model_cfg["_experiment_mode"] = str(self.cfg.get("mode") or "integrated")
+            bundle = load_for_sid(
+                model_cfg,
+                ctx.sid_table,
+                local_rank=lr,
+                attn_implementation=attn,
+                experiment_mode=model_cfg["_experiment_mode"],
+            )
+        # Strategy binding is trainer/stage-owned (see run_sft / run_grpo / run_dpo).
+        if runtime is not None:
+            ctx.runtime = runtime
         if frozen:
             bundle.model.eval()
             for p in bundle.model.parameters():
@@ -458,9 +592,20 @@ class MiniOneRecPipeline(Pipeline):
         )
 
     def build_rollout(self, ctx: StageContext) -> Any:
+        from llm4rec.runtime.kv_cache import resolve_kv_cache
         from llm4rec.trainers.rollouts import ConstrainedBeamRollout
 
-        return ConstrainedBeamRollout(ctx.sid_table)
+        # Constrained beam + prefix_allowed_tokens_fn → dynamic cache only.
+        resolve_kv_cache(self.cfg, constrained=True)
+        rl = (self.cfg.get("train") or {}).get("rl") or {}
+        grpo = rl.get("grpo") or {}
+        return ConstrainedBeamRollout(
+            ctx.sid_table,
+            do_sample=bool(grpo.get("do_sample", True)),
+            temperature=float(grpo.get("temperature") or 1.0),
+            length_penalty=float(grpo.get("length_penalty") or 0.0),
+            beam_search=bool(grpo.get("beam_search", True)),
+        )
 
     def build_reward(self, ctx: StageContext) -> Any:
         from llm4rec.trainers.rewards import make_minionerec_reward
@@ -487,9 +632,17 @@ class RecR1Pipeline(Pipeline):
         from llm4rec.sid.model import load_trained, resolve_checkpoint, resolve_dtype
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        runtime = self.runtime or ctx.runtime
+        attn = runtime.attention_implementation() if runtime is not None else "sdpa"
+        lr = dist_utils.local_rank()
         dtype_name = str(self.cfg["hardware"].get("precision") or "fp32")
         if ctx.checkpoint:
-            bundle = load_trained(ctx.checkpoint, dtype=dtype_name)
+            bundle = load_trained(
+                ctx.checkpoint,
+                dtype=dtype_name,
+                local_rank=lr,
+                attn_implementation=attn,
+            )
             model, tokenizer = bundle.model, bundle.tokenizer
         else:
             # Rec-R1 不需要 SID 词表扩展，直接加载 backbone
@@ -497,13 +650,22 @@ class RecR1Pipeline(Pipeline):
             tokenizer = AutoTokenizer.from_pretrained(checkpoint)
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
-            model = AutoModelForCausalLM.from_pretrained(
-                checkpoint, dtype=resolve_dtype(dtype_name)
-            )
+            load_kwargs: dict[str, Any] = {
+                "dtype": resolve_dtype(dtype_name),
+                "attn_implementation": attn or "sdpa",
+            }
+            try:
+                model = AutoModelForCausalLM.from_pretrained(checkpoint, **load_kwargs)
+            except Exception:
+                load_kwargs["attn_implementation"] = "eager"
+                model = AutoModelForCausalLM.from_pretrained(checkpoint, **load_kwargs)
             import torch
 
             if torch.cuda.is_available():
-                model = model.cuda()
+                model = model.to(f"cuda:{lr}")
+        # Strategy binding is trainer/stage-owned.
+        if runtime is not None:
+            ctx.runtime = runtime
         if frozen:
             model.eval()
             for p in model.parameters():
@@ -523,13 +685,20 @@ class RecR1Pipeline(Pipeline):
         )
 
     def build_rollout(self, ctx: StageContext) -> Any:
+        from llm4rec.runtime.kv_cache import generation_cache_kwargs, resolve_kv_cache
         from llm4rec.trainers.rollouts import SamplingRollout
 
         grpo = self.cfg["train"]["rl"]["grpo"]
+        choice = resolve_kv_cache(self.cfg, constrained=False)
+        cache_kwargs = generation_cache_kwargs(choice)
         return SamplingRollout(
             temperature=float(grpo.get("temperature") or 0.6),
             top_p=float(grpo.get("top_p") or 0.95),
             max_new_tokens=int(self.cfg["train"]["rl"].get("max_response_length") or 512),
+            use_cache=bool(cache_kwargs.get("use_cache", True)),
+            cache_implementation=cache_kwargs.get("cache_implementation"),
+            kv_choice=choice,
+            cfg=self.cfg,
         )
 
     def build_reward(self, ctx: StageContext) -> Any:
@@ -630,6 +799,7 @@ class DPO4RecPipeline(Pipeline):
             logger=self.logger,
             callbacks=[hook] if hook else [],
             on_iteration_end=on_iteration_end,
+            runtime=self.runtime,
         )
         if hook:
             summary["bias_curve"] = hook.history

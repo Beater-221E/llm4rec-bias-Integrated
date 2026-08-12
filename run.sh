@@ -32,7 +32,9 @@ set -euo pipefail
 
 # 跑哪条路线：minionerec | recr1 | dpo4rec
 #   对应 configs/exp/<EXP>.yaml
-EXP="${EXP:-minionerec}"
+# ★ 必须显式设置，例如：
+#     EXP=minionerec_qwen05b_amazon GPUS=auto bash run.sh
+EXP="${EXP:-}"
 
 # 跑哪些阶段。留空 = 用 configs/exp/<EXP>.yaml 里写的 stages。
 #   minionerec: sft,eval,rl,eval        （SFT→评→RL→评，全自动串起来）
@@ -42,9 +44,10 @@ EXP="${EXP:-minionerec}"
 STAGES="${STAGES:-}"
 
 # 用哪几张卡（逗号分隔）。多卡会自动起 torchrun。
-#   SFT   : HF Trainer，可配 DeepSpeed ZeRO（见下面 DEEPSPEED）
-#   RL/DPO: 手写训练循环，走 DDP（按 rank 分样本 + all-reduce 梯度）
-GPUS="${GPUS:-0,1,2,3}"
+#   GPUS=auto  → 不限制 CUDA_VISIBLE_DEVICES，检测全部可见 GPU
+#   GPUS=0     → 单卡
+#   GPUS=0,2   → 仅使用指定卡
+GPUS="${GPUS:-auto}"
 
 # DeepSpeed（只作用于 SFT 阶段）：留空 = 不用，用 DDP
 #   zero2 | zero2_offload | zero3   → configs/deepspeed/<name>.json
@@ -76,6 +79,21 @@ CONDA_ENV="${CONDA_ENV:-bias}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
+if [[ -z "${EXP}" ]]; then
+  cat <<'EOF' >&2
+ERROR: EXP is required.
+
+Examples:
+  EXP=minionerec_qwen05b_amazon GPUS=auto bash run.sh
+  EXP=minionerec_reproduction_qwen05b GPUS=0,1 bash run.sh
+  EXP=recr1_qwen05b_amazon STAGES=sft,eval GPUS=auto bash run.sh
+
+List experiments:
+  python -m llm4rec.cli.main list
+EOF
+  exit 1
+fi
+
 # 命令行尾部的 key=value 也当作 override
 OVERRIDES+=("$@")
 
@@ -85,6 +103,19 @@ mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/${EXP}_${TS}.log"
 
 log() { printf '%s\n' "$*" | tee -a "$LOG"; }
+
+# Persist console output to $LOG, but drop tqdm progress-only rows
+# (e.g. " 61%|█| 6500/10728 [..]") which spam the file when stdout is not a TTY.
+# Periodic Trainer metrics like "{'loss': ...}" are kept.
+_tee_train_log() {
+  # Match HF/tqdm progress bars; keep blank lines after metrics for readability
+  local prog='^[[:space:]]*[0-9]+%\|'
+  if command -v stdbuf >/dev/null 2>&1; then
+    stdbuf -oL -eL tee >(stdbuf -oL grep -a -Ev "$prog" >>"$LOG")
+  else
+    tee >(grep -a --line-buffered -Ev "$prog" >>"$LOG")
+  fi
+}
 
 # —— 环境 ——
 if [[ -n "$CONDA_ENV" ]]; then
@@ -99,7 +130,6 @@ fi
 
 export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
-export CUDA_VISIBLE_DEVICES="$GPUS"
 export TOKENIZERS_PARALLELISM=false
 
 export WANDB_MODE="$WANDB_MODE"
@@ -107,13 +137,42 @@ export WANDB_PROJECT="$WANDB_PROJECT"
 [[ -n "$WANDB_ENTITY" ]] && export WANDB_ENTITY="$WANDB_ENTITY"
 [[ -n "$WANDB_RUN_NAME" ]] && export WANDB_NAME="$WANDB_RUN_NAME"
 
-# 多卡：NCCL 在部分机器（无 P2P/IB）上不 disable 会挂在 torchrun 启动
-NGPU="$(awk -F',' '{print NF}' <<<"$GPUS")"
+# devices:auto → do not restrict CUDA_VISIBLE_DEVICES; otherwise pin to GPUS
+if [[ "$GPUS" == "auto" ]]; then
+  unset CUDA_VISIBLE_DEVICES || true
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    NGPU="$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')"
+  else
+    NGPU=0
+  fi
+  if [[ -z "$NGPU" || "$NGPU" -lt 1 ]]; then
+    NGPU=1
+  fi
+  log "GPUS=auto → using all visible devices (n=$NGPU)"
+else
+  export CUDA_VISIBLE_DEVICES="$GPUS"
+  NGPU="$(awk -F',' '{print NF}' <<<"$GPUS")"
+fi
+
+# 多卡 NCCL：
+#   - Ampere+ / NVLink：默认拓扑自检（可设 LLM4REC_NCCL_COMPAT=1 强制兼容档）
+#   - 预 Ampere（V100 等 cc<8）：默认开兼容档，否则 P2P barrier/allreduce 易死锁
+#   - 显式 LLM4REC_NCCL_COMPAT=0 可关闭自动兼容
 if (( NGPU > 1 )); then
-  export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
-  export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
-  export NCCL_NVML_ENABLE="${NCCL_NVML_ENABLE:-0}"
   export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+  _cc_major="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | cut -d. -f1)"
+  _auto_compat=0
+  if [[ -n "${_cc_major}" && "${_cc_major}" -lt 8 ]]; then
+    _auto_compat=1
+  fi
+  if [[ "${LLM4REC_NCCL_COMPAT:-}" == "1" || ( "${LLM4REC_NCCL_COMPAT:-}" != "0" && "${_auto_compat}" == "1" ) ]]; then
+    export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
+    export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+    export NCCL_NVML_ENABLE="${NCCL_NVML_ENABLE:-0}"
+    log "NCCL compat profile ON (P2P/IB disabled; cc=${_cc_major:-unknown})"
+  else
+    log "NCCL defaults: topology detection enabled (set LLM4REC_NCCL_COMPAT=1 to disable P2P/IB)"
+  fi
 fi
 
 # —— 组装 CLI 参数 ——
@@ -158,9 +217,9 @@ if (( NGPU > 1 )); then
     --standalone \
     --nproc_per_node "$NGPU" \
     --master_port "$MASTER_PORT" \
-    -m llm4rec.cli.main run "${ARGS[@]}" 2>&1 | tee -a "$LOG"
+    -m llm4rec.cli.main run "${ARGS[@]}" 2>&1 | _tee_train_log
 else
-  python -m llm4rec.cli.main run "${ARGS[@]}" 2>&1 | tee -a "$LOG"
+  python -m llm4rec.cli.main run "${ARGS[@]}" 2>&1 | _tee_train_log
 fi
 
 log ""

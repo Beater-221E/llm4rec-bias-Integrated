@@ -19,17 +19,22 @@ from llm4rec.trainers.grpo import Rollout
 
 
 def make_minionerec_reward(sid_table: Any, cfg: dict[str, Any]):
-    """对齐官方 ``rl.py`` 的 ``reward_type="ranking"``。
-
-    官方是两个 reward 函数相加：
-
-        rule_reward(i)      = 1.0 命中目标 SID / 0.0 未命中
-        ndcg_rule_reward(i) = 组内第 i 条的位次奖励；官方写法是
-                              w = [-1/log2(i+2)]，再整体除以 sum 取负，
-                              等价于归一化后的 1/log2(i+2)，且只在命中时给。
+    """MiniOneRec reward. ``implementation: minionerec_reference`` (default for
+    reproduction) matches upstream ``rl.py`` rule + ndcg_rule; ``integrated``
+    keeps the SID-parse experimental variant.
     """
     reward_cfg = cfg.get("reward") or {}
+    implementation = str(
+        reward_cfg.get("implementation") or cfg.get("reward_implementation") or ""
+    ).lower()
     kind = str(reward_cfg.get("type") or "ranking")
+    if implementation == "minionerec_reference" or (
+        not implementation
+        and str((cfg.get("mode") or (cfg.get("experiment") or {}).get("mode") or "")).lower()
+        == "reproduction"
+    ):
+        return make_minionerec_reference_reward(cfg, kind=kind)
+
     invalid_penalty = float(reward_cfg.get("invalid_penalty") or -1.0)
 
     def _positional_weights(n: int) -> list[float]:
@@ -55,6 +60,68 @@ def make_minionerec_reward(sid_table: Any, cfg: dict[str, Any]):
             else:  # ranking = rule + ndcg_rule
                 out.append(hit + (weights[i] if hit else 0.0))
         return out
+
+    return reward_fn
+
+
+def reference_ndcg_weights(num_generations: int) -> list[float]:
+    """Upstream ``rl.py``: negative, most-negative at rank 0."""
+    raw = [-1.0 / math.log2(i + 2) for i in range(num_generations)]
+    total = sum(raw)
+    return [-x / total for x in raw] if total else [0.0] * num_generations
+
+
+def reference_rule_reward(completions: Sequence[str], targets: Sequence[str]) -> list[float]:
+    return [
+        1.0 if c.strip('\n" ') == t.strip('\n" ') else 0.0
+        for c, t in zip(completions, targets)
+    ]
+
+
+def reference_ndcg_rule_reward(
+    completions: Sequence[str], targets: Sequence[str], num_generations: int
+) -> list[float]:
+    """Upstream: per G-group, if any hit → hits get 0, misses get negative weight."""
+    weights = reference_ndcg_weights(num_generations)
+    rewards: list[float] = []
+    i = 0
+    n = len(completions)
+    while i < n:
+        group = completions[i : i + num_generations]
+        gt = targets[i : i + num_generations]
+        hits = [
+            c.strip('\n"') == t.strip('\n"') for c, t in zip(group, gt)
+        ]
+        if any(hits):
+            rewards.extend(
+                0.0 if hit else weights[j % num_generations]
+                for j, hit in enumerate(hits)
+            )
+        else:
+            rewards.extend([0.0] * len(group))
+        i += num_generations
+    return rewards
+
+
+def make_minionerec_reference_reward(cfg: dict[str, Any], *, kind: str = "ranking"):
+    """Exact upstream reward: rule + ndcg_rule (target text comparison)."""
+
+    def reward_fn(rollout: Rollout) -> list[float]:
+        target = str(
+            rollout.example.get("reference_target_text")
+            or rollout.example.get("target_sid")
+            or rollout.example.get("target_item")
+        )
+        completions = [str(t) for t in rollout.texts]
+        g = len(completions)
+        targets = [target] * g
+        rule = reference_rule_reward(completions, targets)
+        if kind == "rule":
+            return rule
+        if kind == "ranking_only":
+            return reference_ndcg_rule_reward(completions, targets, g)
+        ndcg = reference_ndcg_rule_reward(completions, targets, g)
+        return [r + n for r, n in zip(rule, ndcg)]
 
     return reward_fn
 

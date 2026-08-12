@@ -62,9 +62,16 @@ def init_process_group() -> bool:
     if dist.is_initialized():
         return True
     backend = "nccl" if torch.cuda.is_available() else "gloo"
-    dist.init_process_group(backend=backend)
+    # Bind CUDA device *before* NCCL init; pass device_id so barriers/collectives
+    # do not guess the wrong GPU (PyTorch warning → hang on V100 multi-GPU).
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank())
+        dist.init_process_group(
+            backend=backend,
+            device_id=torch.device(f"cuda:{local_rank()}"),
+        )
+    else:
+        dist.init_process_group(backend=backend)
     return True
 
 
@@ -74,19 +81,23 @@ def cleanup() -> None:
 
 
 def barrier(name: str = "") -> None:
-    if dist.is_available() and dist.is_initialized():
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    if torch.cuda.is_available():
+        dist.barrier(device_ids=[local_rank()])
+    else:
         dist.barrier()
 
 
 # ------------------------------------------------------------------ 模型
 
 
-def wrap_ddp(model: Any) -> Any:
+def wrap_ddp(model: Any, *, find_unused_parameters: bool = False) -> Any:
     """包成 DDP，让 ``loss.backward()`` 自动 all-reduce 梯度。
 
-    ``find_unused_parameters=True``：GRPO 里一个 step 可能只有部分参数参与
-    （比如某组 advantage 全 0 时），不开这个会在第二个 step 直接卡死。
-    代价是一点点通信开销，稳定性优先。
+    Default ``find_unused_parameters=False``: zero advantages still execute the
+    full transformer graph, so parameters are not unused. Override only for
+    routes that genuinely skip subgraphs.
     """
     if not is_distributed():
         return model
@@ -97,13 +108,99 @@ def wrap_ddp(model: Any) -> Any:
         model,
         device_ids=device_ids,
         output_device=local_rank() if torch.cuda.is_available() else None,
-        find_unused_parameters=True,
+        find_unused_parameters=bool(find_unused_parameters),
     )
+
+
+def wrap_fsdp(
+    model: Any,
+    *,
+    param_dtype: torch.dtype | None = None,
+    reduce_dtype: torch.dtype | None = None,
+    buffer_dtype: torch.dtype | None = None,
+) -> Any:
+    """Optional FSDP wrap. Precision comes from RuntimeContext, not GPU capability."""
+    if not is_distributed():
+        return model
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import MixedPrecision
+    except ImportError:
+        return wrap_ddp(model, find_unused_parameters=False)
+
+    mp = None
+    # Only enable MixedPrecision when an explicit non-fp32 dtype is provided.
+    if param_dtype is not None and param_dtype != torch.float32:
+        mp = MixedPrecision(
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype or param_dtype,
+            buffer_dtype=buffer_dtype or param_dtype,
+        )
+    return FSDP(
+        model,
+        mixed_precision=mp,
+        device_id=local_rank() if torch.cuda.is_available() else None,
+    )
+
+
+def is_fsdp(model: Any) -> bool:
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        return isinstance(model, FSDP)
+    except ImportError:
+        return False
 
 
 def unwrap(model: Any) -> Any:
     """取回底层模型（存盘、generate 都要用没包 DDP 的那个）。"""
     return getattr(model, "module", model)
+
+
+def save_pretrained_distributed(
+    model: Any,
+    output_dir: Any,
+    *,
+    tokenizer: Any = None,
+    is_main: bool | None = None,
+) -> None:
+    """Save HF weights: FSDP full-state gather on rank0; DDP unwrap otherwise."""
+    from pathlib import Path
+
+    out = Path(output_dir)
+    main = is_main if is_main is not None else globals()["is_main"]()
+    if is_fsdp(model):
+        try:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+        except ImportError:
+            if main:
+                out.mkdir(parents=True, exist_ok=True)
+                unwrap(model).save_pretrained(str(out))
+                if tokenizer is not None:
+                    tokenizer.save_pretrained(str(out))
+            return
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
+            state = model.state_dict()
+        if main:
+            out.mkdir(parents=True, exist_ok=True)
+            # Prefer HF save via unwrapped module if available
+            inner = getattr(model, "module", model)
+            if hasattr(inner, "save_pretrained"):
+                # Write gathered tensors onto a CPU copy of config-bearing module
+                inner.save_pretrained(str(out), state_dict=state)
+            else:
+                torch.save(state, out / "pytorch_model.bin")
+            if tokenizer is not None:
+                tokenizer.save_pretrained(str(out))
+        return
+
+    if main:
+        out.mkdir(parents=True, exist_ok=True)
+        unwrap(model).save_pretrained(str(out))
+        if tokenizer is not None:
+            tokenizer.save_pretrained(str(out))
 
 
 @contextmanager
@@ -142,6 +239,16 @@ def all_reduce_mean(value: float) -> float:
     return float(tensor.item() / world_size())
 
 
+def all_reduce_min_int(value: int) -> int:
+    """跨卡取最小值 —— memory-auto 探测后统一 micro-batch，避免 DDP 步数错位死锁。"""
+    if not is_distributed():
+        return int(value)
+    device = f"cuda:{local_rank()}" if torch.cuda.is_available() else "cpu"
+    tensor = torch.tensor([int(value)], device=device, dtype=torch.long)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MIN)
+    return int(tensor.item())
+
+
 def all_gather_object(obj: Any) -> list[Any]:
     if not is_distributed():
         return [obj]
@@ -154,3 +261,18 @@ def summary_line() -> str:
     if not is_distributed():
         return "单卡"
     return f"多卡 DDP：rank {rank()}/{world_size()} (local_rank={local_rank()})"
+
+
+def print_distributed_banner(log=print) -> None:
+    """Rank-0 only summary of distributed / NCCL settings."""
+    if not is_main():
+        return
+    import os
+
+    log(f"[dist] {summary_line()}")
+    if is_distributed():
+        log(
+            f"[dist] NCCL_P2P_DISABLE={os.environ.get('NCCL_P2P_DISABLE', '<unset>')} "
+            f"NCCL_IB_DISABLE={os.environ.get('NCCL_IB_DISABLE', '<unset>')} "
+            f"LLM4REC_NCCL_COMPAT={os.environ.get('LLM4REC_NCCL_COMPAT', '0')}"
+        )

@@ -61,12 +61,57 @@ def resolve_checkpoint(model_cfg: dict[str, Any]) -> str:
     return str(ckpt)
 
 
+def initialize_added_tokens(
+    model: PreTrainedModel,
+    *,
+    old_vocab_size: int,
+    new_token_ids: list[int],
+    mode: str = "reference",
+) -> str:
+    """Initialize newly added SID embedding rows.
+
+    ``reference`` — leave ``resize_token_embeddings`` rows untouched (MiniOneRec).
+    ``mean_noise`` — mean of prior rows + small Gaussian noise (integrated experiment).
+    """
+    mode_l = str(mode or "reference").lower().strip()
+    if mode_l in {"reference", "resize", "none", "hf"}:
+        return "reference"
+    if mode_l not in {"mean_noise", "mean+noise", "mean"}:
+        raise ConfigurationError(
+            f"unsupported sid_token_initialization='{mode}' "
+            "(allowed: reference | mean_noise)"
+        )
+    if not new_token_ids:
+        return "mean_noise"
+    with torch.no_grad():
+        emb = model.get_input_embeddings().weight
+        mean = emb[:old_vocab_size].mean(dim=0)
+        for idx in new_token_ids:
+            emb[idx] = mean + 0.02 * torch.randn_like(mean)
+        out = model.get_output_embeddings()
+        if out is not None and out.weight is not emb:
+            out_mean = out.weight[:old_vocab_size].mean(dim=0)
+            for idx in new_token_ids:
+                out.weight[idx] = out_mean + 0.02 * torch.randn_like(out_mean)
+    return "mean_noise"
+
+
+def resolve_sid_token_initialization(model_cfg: dict[str, Any], *, mode: str) -> str:
+    """Default: reproduction → reference; integrated → mean_noise (or configured)."""
+    raw = model_cfg.get("sid_token_initialization")
+    if raw is not None and str(raw).strip():
+        return str(raw).lower().strip()
+    return "reference" if mode == "reproduction" else "mean_noise"
+
+
 def load_for_sid(
     model_cfg: dict[str, Any],
     table: SidTable,
     *,
     checkpoint_override: str | None = None,
     local_rank: int = 0,
+    attn_implementation: str | None = None,
+    experiment_mode: str | None = None,
 ) -> SidModelBundle:
     """加载 backbone 或已有 checkpoint，并确保 SID token 就位。
 
@@ -86,11 +131,20 @@ def load_for_sid(
     sid_tokens = table.all_tokens()
     n_added = tokenizer.add_tokens(sid_tokens, special_tokens=False)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        checkpoint,
-        dtype=dtype,
-        trust_remote_code=bool(model_cfg.get("trust_remote_code", False)),
-    )
+    load_kwargs: dict[str, Any] = {
+        "dtype": dtype,
+        "trust_remote_code": bool(model_cfg.get("trust_remote_code", False)),
+    }
+    attn = attn_implementation or model_cfg.get("attn_implementation")
+    if attn:
+        load_kwargs["attn_implementation"] = str(attn)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(checkpoint, **load_kwargs)
+    except Exception:
+        # Eager fallback if sdpa/flash unavailable
+        load_kwargs.pop("attn_implementation", None)
+        load_kwargs["attn_implementation"] = "eager"
+        model = AutoModelForCausalLM.from_pretrained(checkpoint, **load_kwargs)
 
     old_size = model.get_input_embeddings().num_embeddings
     if len(tokenizer) > old_size:
@@ -100,19 +154,18 @@ def load_for_sid(
     if any(i is None or i < 0 for i in new_ids):
         raise ConfigurationError("SID token 加入词表失败")
 
+    mode = str(experiment_mode or model_cfg.get("_experiment_mode") or "integrated")
+    init_mode = resolve_sid_token_initialization(model_cfg, mode=mode)
     if n_added > 0:
-        # 新增行用旧词表的均值初始化 + 小噪声。全零初始化会让新 token 的
-        # logit 全部相同，前几百步基本学不动。
-        with torch.no_grad():
-            emb = model.get_input_embeddings().weight
-            mean = emb[:old_size].mean(dim=0)
-            for idx in new_ids:
-                emb[idx] = mean + 0.02 * torch.randn_like(mean)
-            out = model.get_output_embeddings()
-            if out is not None and out.weight is not emb:
-                out_mean = out.weight[:old_size].mean(dim=0)
-                for idx in new_ids:
-                    out.weight[idx] = out_mean + 0.02 * torch.randn_like(out_mean)
+        applied = initialize_added_tokens(
+            model,
+            old_vocab_size=old_size,
+            new_token_ids=new_ids,
+            mode=init_mode,
+        )
+    else:
+        applied = init_mode if init_mode == "reference" else "reference"
+    model_cfg["_sid_token_initialization_effective"] = applied
 
     if bool(model_cfg.get("gradient_checkpointing", False)):
         model.gradient_checkpointing_enable()
@@ -151,6 +204,7 @@ def load_trained(
     *,
     dtype: str = "fp32",
     local_rank: int = 0,
+    attn_implementation: str | None = None,
 ) -> SidModelBundle:
     """加载我们自己存的全参 checkpoint（SID token 已经在里面了）。
 
@@ -164,7 +218,14 @@ def load_trained(
     tokenizer = AutoTokenizer.from_pretrained(path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(path, dtype=resolve_dtype(dtype))
+    load_kwargs: dict[str, Any] = {"dtype": resolve_dtype(dtype)}
+    if attn_implementation:
+        load_kwargs["attn_implementation"] = str(attn_implementation)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(path, **load_kwargs)
+    except Exception:
+        load_kwargs["attn_implementation"] = "eager"
+        model = AutoModelForCausalLM.from_pretrained(path, **load_kwargs)
     if torch.cuda.is_available():
         model = model.to(f"cuda:{local_rank}")
     return SidModelBundle(
