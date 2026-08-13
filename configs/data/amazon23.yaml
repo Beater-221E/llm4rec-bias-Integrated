@@ -1,0 +1,34 @@
+# =============================================================================
+# Amazon Reviews 2023 — 三条路线共用的统一语料
+# 原始文件：https://amazon-reviews-2023.github.io/
+#   {Category}.jsonl.gz        评论
+#   meta_{Category}.jsonl.gz   物品元数据（keyed by parent_asin）
+# =============================================================================
+
+data:
+  name: amazon23
+  category: Industrial_and_Scientific
+  # 提示语里对类目的自然语言描述（进 prompt 模板）
+  category_prompt: industrial and scientific items
+
+  raw_dir: data/raw/amazon23
+  processed_dir: data/processed/amazon23
+
+  # —— 过滤 ——
+  min_uc: 5                  # 用户至少交互数
+  min_sc: 5                  # 物品至少被交互数
+  iterative_kcore: true      # 反复迭代直到同时满足 min_uc / min_sc
+  rating_threshold: 4.0      # >= 4 星算正样本
+
+  # —— 划分 ——
+  split: leave_one_out       # 每个用户最后一条→test，倒数第二条→val
+  history_max_length: 20
+  min_history: 2
+
+  # —— 采样上限（debug/smoke 用；-1 = 不限）——
+  max_train_samples: -1
+  max_eval_samples: -1
+
+  # —— 物品文本（RQ-VAE 编码 + BM25 索引 + reranker 都读这个）——
+  item_text_fields: [title, description, categories, brand]
+  item_text_max_chars: 512

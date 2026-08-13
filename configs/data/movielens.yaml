@@ -1,0 +1,35 @@
+# =============================================================================
+# MovieLens (ML-1M / ML-100K)
+#
+# 换数据集只需要在 exp 配置的 defaults 里把 `data/amazon23` 换成 `data/movielens`，
+# 或者命令行 `bash run.sh data.name=movielens data.variant=ml-1m`。
+# 代码零改动 —— SID 构建、BM25、样本构建、bias 评测都只认 DatasetAdapter 的契约。
+#
+# DPO4Rec 原文用的就是 ML-1M（6040 用户 / 3416 电影 / 1M 评分，rating 4-5 为正），
+# 要和论文数字对齐就用这个。
+# =============================================================================
+
+data:
+  name: movielens
+  variant: ml-1m               # ml-1m | ml-100k
+  category: ml-1m              # 产物目录名，与 variant 保持一致即可
+  category_prompt: movies
+
+  raw_dir: data/raw/movielens
+  processed_dir: data/processed/movielens
+
+  min_uc: 5
+  min_sc: 5
+  iterative_kcore: true
+  rating_threshold: 4.0        # 论文：rating 4/5 为正
+
+  split: leave_one_out
+  history_max_length: 20
+  min_history: 2
+
+  max_train_samples: -1
+  max_eval_samples: -1
+
+  # MovieLens 没有商品描述，只有标题 + 类型
+  item_text_fields: [title, categories]
+  item_text_max_chars: 256

@@ -1,0 +1,158 @@
+# =============================================================================
+# 主实验配置：MiniOneRec × Qwen2.5-0.5B-Instruct × Amazon Reviews 2023
+#
+# 默认起跑配置。SID 算法参数只在 configs/sid/rqvae.yaml；本文件只写实验差异项
+# （数据类目 / 训练超参 / wandb）。改 codebook_size 请改 sid/rqvae.yaml，或：
+#     bash prepare.sh sid.codebook_size=256
+#
+# 跑法：
+#     bash prepare.sh EXP=minionerec_qwen05b_amazon    # 下载 → 预处理 → SID（跑一次）
+#     EXP=minionerec_qwen05b_amazon bash run.sh        # SFT → eval → RL → eval
+#
+# 硬件预算（Qwen2.5-0.5B 全参，fp32）：
+#     SFT  单卡 ≈ 14 GB（bs=2, seq=512, grad_ckpt 开）；4 卡 DDP ≈ 每卡同样
+#     RL   单卡 ≈ 18 GB（policy + 冻结 ref model + G=16 采样）
+#     V100-32G / A100-40G 都够。显存紧就调小 per_device_batch_size 或 group_size。
+# =============================================================================
+
+defaults:
+  - base
+  - data/amazon23
+  - model/qwen2.5-0.5b-instruct
+  - route/minionerec/common
+  - route/minionerec/integrated
+  - sid/rqvae
+  - bias/default
+
+experiment:
+  name: minionerec_qwen05b_amazon
+  route: minionerec
+  mode: integrated          # integrated | reproduction
+
+seed: 42
+
+# SFT 训完存盘 → 评一次拿 bias 基线 → RL 自动接上 → 存盘 → 完整评测
+stages: [sft, eval, rl, eval]
+
+# ───────────────────────────── 数据 ─────────────────────────────
+data:
+  category: Industrial_and_Scientific   # 换类目改这里（Office_Products 等）
+  # 下载：评论 644 MB + 元数据 268 MB，`STEPS=download bash prepare.sh` 自动拉
+  min_uc: 5                # 用户至少 5 次交互
+  min_sc: 5                # 物品至少被 5 次交互
+  rating_threshold: 4.0    # >= 4 星算正样本
+  history_max_length: 20
+  max_train_samples: -1    # 冒烟时改成 2000
+  max_eval_samples: -1     # 冒烟时改成 200
+
+# ──────────────────────────── 硬件 ────────────────────────────
+hardware:
+  devices: auto
+  precision: auto
+  strategy: auto
+  memory: auto
+  gradient_checkpointing: true
+  # 0.5B 全参单卡放得下，DDP 就够，不必上 DeepSpeed。
+  deepspeed: null
+
+# ─────────────────────────── 训练 ───────────────────────────
+train:
+  # ---------------------------------------------------------------- SFT
+  sft:
+    tasks: [seqrec, title2sid, sid2title]   # 官方的多任务混合
+
+    epochs: 3
+    max_steps: null                # 非 null 时优先于 epochs
+
+    learning_rate: 1.0e-5
+    lr_scheduler_type: cosine
+    warmup_ratio: 0.03
+    weight_decay: 0.0
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    max_grad_norm: 1.0
+
+    # 官方 sft.sh 是 8 卡 × micro 16 = 全局 1024。
+    # 设 global_batch_size 后，换卡数会自动重算 gradient_accumulation_steps。
+    global_batch_size: 64
+    per_device_batch_size: 2
+    gradient_accumulation_steps: 8
+    max_seq_length: 512
+
+    logging_steps: 10
+    eval_steps: 200                # 每 200 step 在 val 上算 loss
+    load_best_model_at_end: false  # true 时需要 checkpoint.save_steps 已开启
+    early_stopping_patience: null
+
+  # ---------------------------------------------------------------- RL
+  rl:
+    algorithm: grpo
+
+    epochs: 2                      # 官方 rl.sh: num_train_epochs=2
+    max_steps: null
+
+    # ★ RL 按 step 走，评测频率也按 step 配
+    eval_steps: 25                 # 每 25 step 评一次准确率
+    bias_eval_steps: 25            # 每 25 step 评一次 bias（null = 跟随 eval_steps）
+    eval_examples: 256             # 在线评测的固定 held-out 子集（不落 checkpoint）
+    logging_steps: 1
+
+    learning_rate: 1.0e-5          # 官方 rl.sh: --learning_rate 1e-5
+    lr_scheduler_type: constant
+    warmup_ratio: 0.0
+    weight_decay: 0.0
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    max_grad_norm: 0.3
+
+    per_device_batch_size: 1
+    gradient_accumulation_steps: 8
+    global_batch_size: 8       # 保持跨卡数一致的有效全局 batch
+    max_prompt_length: 512
+
+    grpo:
+      group_size: 16               # 官方 --num_generations 16
+      beta: 1.0e-3                 # 官方 --beta 1e-3（KL 系数）
+      clip_epsilon: 0.2
+      temperature: 1.0             # 官方 --temperature 1.0
+      updates_per_rollout: 1
+      advantage_normalization: group
+      constrained_rollout: true    # 官方 --beam_search True
+      sync_ref_model: true         # 官方 --sync_ref_model True
+      dapo: false                  # 官方 --dapo False
+      dynamic_sampling: false
+
+    reward:
+      # 官方 reward_type="ranking" = [rule_reward, ndcg_rule_reward]
+      type: ranking
+      invalid_penalty: -1.0
+      # ★ 不加任何 bias 惩罚项 —— 要观测的正是"纯准确率 reward 会不会放大 bias"
+
+# ───────────────────────── bias 评测 ─────────────────────────
+bias:
+  online_stages: [rl]       # SFT 期间不评（只在 stage 结束评一次基线）
+  top_k: 10
+  final_examples: null      # null = 全量 test
+  ips_gamma: 1.0
+
+# ──────────────────────── checkpoint ────────────────────────
+checkpoint:
+  save_stage_final: true    # 每个 stage 结束存一份完整权重
+  save_steps: 500           # 训练中每隔 N step 存中间 checkpoint（null 关闭）
+  save_total_limit: 3
+  save_optimizer_state: false
+
+# ─────────────────────────── wandb ───────────────────────────
+wandb:
+  enabled: true
+  project: llm4rec-bias
+  entity: null              # 填你们的 team
+  group: minionerec_qwen05b_amazon
+  tags: [minionerec, qwen0.5b, amazon23, rqvae]
+  mode: online
+
+evaluation:
+  top_k: [1, 5, 10, 20]
+  metrics: [hr, ndcg, mrr]

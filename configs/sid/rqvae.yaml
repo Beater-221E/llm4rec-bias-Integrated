@@ -1,0 +1,56 @@
+# =============================================================================
+# Semantic ID — single source of truth for the integrated profile.
+#
+# Do NOT restate codebook_size / rqvae / encoder in route or exp YAMLs.
+# Override only via CLI (e.g. sid.codebook_size=256) or a dedicated exp variant.
+#
+# MiniOneRec reproduction (codebooks=[256,256,256], no PCA, official layers)
+# lives in route/minionerec/reproduction.yaml and is forced again by modes.py.
+# =============================================================================
+
+sid:
+  method: rqvae                 # rqvae | rqkmeans
+  implementation: integrated    # integrated | minionerec_reference
+  levels: 3
+  codebook_size: 512
+  layer_prefixes: [a, b, c]
+  # Soft threshold only when >0 and <1. Zero collision is NOT required unless
+  # sid.strict_unique: true
+  max_collision_rate: 1.0
+  strict_unique: false
+  collision_handling: sinkhorn_last_level
+
+  encoder:
+    model: Qwen/Qwen3-Embedding-4B
+    local_path: data/models/Qwen3-Embedding-4B
+    batch_size: 4
+    max_length: 1024
+    pooling: mean
+    dtype: fp16
+    device: cuda:0
+
+  # —— Integrated / simplified RQ-VAE ——
+  rqvae:
+    pca_dim: 512                # ignored in MiniOneRec reproduction
+    latent_dim: 64
+    hidden_dim: 512
+    beta: 0.25
+    epochs: 2000
+    batch_size: 2048
+    lr: 3.0e-4
+    warm_start_size: 8192
+    kmeans_init: true
+    kmeans_iters: 100
+    dead_code_every: 100
+    log_every: 50
+    early_collision_patience: 40
+    sk_iters: 50
+    sk_epsilon_last: 0.003
+    collision_retry_iters: 20
+
+  rqkmeans:
+    pca_dim: 256
+    enforce_unique: true
+
+  import_from: null
+  artifacts_root: artifacts/sid

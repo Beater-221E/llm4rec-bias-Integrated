@@ -1,20 +1,32 @@
-# llm4rec-bias-Integrated — install: pip install -r requirements.txt && pip install -e .
+# 安装：pip install -r requirements.txt && pip install -e .
+#
+# 注意：本框架【不用 peft/LoRA】—— 官方 MiniOneRec 的 SFT 就是全参微调，
+# 且 LoRA 会低估 RL 对表征的改动（我们后续要做表征分析）。
+
+# —— 配置与工具 ——
 omegaconf>=2.3
 pyyaml>=6.0
 rich>=13.0
 tqdm>=4.66
+
+# —— 数值 ——
 numpy>=1.26
 pandas>=2.0
+scikit-learn>=1.4          # RQ-VAE 的 PCA / KMeans warm-start
+
+# —— 模型与训练 ——
 torch>=2.2
 transformers>=4.45
-accelerate>=0.34
-peft>=0.13
-trl>=0.12
+accelerate>=0.34           # HF Trainer 多卡后端
 datasets>=2.20
-sentence-transformers>=3.0
-tensorboard>=2.14
-Pillow>=10.0
-requests>=2.31
+sentence-transformers>=3.0 # DPO4Rec 的 knowledge adaptor 编码器
+
+# —— 实验跟踪 ——
+wandb>=0.17
+
+# —— 可选：SFT 阶段的 ZeRO（3B+ 建议装）——
+# deepspeed>=0.14
+
+# —— 开发 ——
 pytest>=8.0
-pytest-cov>=5.0
 ruff>=0.6

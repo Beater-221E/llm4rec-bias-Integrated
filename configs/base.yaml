@@ -1,0 +1,108 @@
+# =============================================================================
+# 全局默认 — 所有实验都会先加载这一层，再被 data/model/sid/bias/exp 逐层覆盖
+# =============================================================================
+
+seed: 42
+
+paths:
+  data_root: data
+  raw_dir: data/raw
+  processed_dir: data/processed
+  artifacts_dir: artifacts     # 静态产物（SID 码本等），训练只读
+  runs_dir: runs               # 每次训练的输出
+  cache_dir: data/cache
+
+hardware:
+  # run.sh 的 GPUS 会覆盖 devices；也可设 auto 由 runtime 检测
+  devices: auto
+  # auto | fp32 | fp16 | bf16 —— 由 runtime.precision 按能力选择；FP8 永不自动开启
+  precision: auto
+  # auto | single | ddp | fsdp | zero2 | zero3
+  strategy: auto
+  strategy_auto:
+    ddp_pressure_threshold: 0.45
+    fsdp_pressure_threshold: 0.70
+  # auto = 可按显存探测下调 micro-batch（reproduction 下不改 global batch）
+  memory: auto
+  find_unused_parameters: false
+  gradient_checkpointing: true
+  activation_checkpointing: auto
+  activation_checkpointing_auto:
+    pressure_threshold: 0.65
+    microbatch_reduction_ratio: 0.5
+  batch_policy:
+    preserve_global_batch: best_effort
+    max_relative_deviation: 0.05
+
+  # —— 多卡策略 ——
+  #   SFT  : 走 HF Trainer，可用 DeepSpeed ZeRO（deepspeed 字段）
+  #   RL/DPO: RuntimeContext.wrap_model → DDP/FSDP
+  deepspeed: null
+  # NCCL：默认不禁用 P2P/IB，让拓扑自检。排查问题时：
+  #   export LLM4REC_NCCL_COMPAT=1
+  env:
+    TOKENIZERS_PARALLELISM: "false"
+    TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+
+profiling:
+  enabled: false
+  wait_steps: 1
+  warmup_steps: 2
+  active_steps: 5
+  cuda_events: true
+
+optimization:
+  compile:
+    enabled: auto          # false in reproduction by default
+    backend: inductor
+    mode: default
+  attention:
+    implementation: auto   # sdpa
+  generation:
+    cache: auto
+    pad_to_multiple_of: 8
+  bucketing:
+    # experimental / inactive: LengthBucketBatchSampler exists but is not wired.
+    # Prefer HF Trainer group_by_length for SFT when desired.
+    enabled: false
+    status: experimental_inactive
+    buckets: [128, 256, 384, 512, 1024]
+  triton:
+    rq_distance_argmin: false
+
+# —— 实验跟踪 ——
+# 一个 run 贯穿 SFT + RL，用 stage 字段区分阶段，
+# 这样 loss / reward 曲线上能一眼看出 RL 从哪一步接上。
+wandb:
+  enabled: true
+  project: llm4rec-bias
+  entity: null                 # 你的 wandb team；null = 个人默认
+  group: null                  # null → 自动填 experiment.name
+  job_type: null               # null → 自动填当前 stage
+  tags: []
+  mode: online                 # online | offline | disabled
+  # 每隔多少 optimizer step 推一次标量
+  log_interval: 1
+  # 训练结束后把 run_dir 下的 metrics json 作为 artifact 上传
+  log_artifacts: false
+
+tracking:
+  console: true
+  jsonl: true                  # run_dir/metrics.jsonl，wandb 挂了也不丢数据
+  tensorboard: false
+
+# —— 评测（三条路线共用，全部在 ranked item list 上算）——
+evaluation:
+  top_k: [1, 5, 10, 20]
+  metrics: [hr, ndcg, mrr]
+  max_examples: null           # null = 全量 test
+  batch_size: 8
+
+# —— checkpoint 策略 ——
+# 默认每隔 save_steps 存一份中间权重（checkpoint-{step}/），并保留最近
+# save_total_limit 个；每个 stage 结束另存 final/。设 save_steps: null 可关掉中间存盘。
+checkpoint:
+  save_stage_final: true       # 每个 stage 结束存一份（SFT 完 / RL 完）
+  save_steps: 500              # 每隔 N 个 optimizer step 存一次；也可用 (0,1) 比例
+  save_total_limit: 3          # 最多保留几个中间 checkpoint（不含 final）
+  save_optimizer_state: false  # 全参 0.5B 的 optimizer state 也有 ~2GB，默认不存

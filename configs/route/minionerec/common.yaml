@@ -1,0 +1,55 @@
+# Shared MiniOneRec route settings (neither reproduction nor integrated specific).
+# Composition:
+#   common.yaml  +  reproduction.yaml   OR   common.yaml  +  integrated.yaml
+
+experiment:
+  route: minionerec
+
+stages: [sft, eval, rl, eval]
+
+decoder:
+  name: constrained_beam
+  num_beams: 20
+  max_new_tokens: 8
+  fail_on_invalid: true
+
+# SID algorithm defaults live in sid/rqvae.yaml (integrated) or
+# route/minionerec/reproduction.yaml (official 256 codebooks). Do not duplicate here.
+
+hardware:
+  devices: auto
+  precision: auto
+  strategy: auto
+  memory: auto
+  find_unused_parameters: false
+  gradient_checkpointing: true
+  deepspeed: null
+
+optimization:
+  compile:
+    enabled: auto
+    backend: inductor
+    mode: default
+  attention:
+    implementation: auto
+  generation:
+    cache: auto
+    pad_to_multiple_of: 8
+  triton:
+    rq_distance_argmin: false
+
+bias:
+  online_stages: [rl]
+  top_k: 10
+  final_examples: null
+  ips_gamma: 1.0
+
+checkpoint:
+  save_stage_final: true
+  save_steps: 500
+  save_total_limit: 3
+  save_optimizer_state: false
+
+evaluation:
+  top_k: [1, 5, 10, 20]
+  metrics: [hr, ndcg, mrr]

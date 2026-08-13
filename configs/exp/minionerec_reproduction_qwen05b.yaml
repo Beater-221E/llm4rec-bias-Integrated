@@ -1,0 +1,33 @@
+# MiniOneRec reproduction experiment — common + reproduction (no integrated inheritance).
+
+defaults:
+  - base
+  - data/amazon23
+  - model/qwen2.5-0.5b-instruct
+  - route/minionerec/common
+  - sid/rqvae                         # encoder / layer_prefixes；码本会被下一层盖成 256
+  - route/minionerec/reproduction      # 官方 SID：codebook_size=256（modes.py 再强制一次）
+  - bias/default
+
+experiment:
+  name: minionerec_reproduction_qwen05b
+  route: minionerec
+  mode: reproduction
+
+seed: 42
+
+data:
+  category: Industrial_and_Scientific
+  min_uc: 5
+  min_sc: 5
+  rating_threshold: 4.0
+  history_max_length: 20
+  max_train_samples: -1
+  max_eval_samples: -1
+
+wandb:
+  enabled: true
+  project: llm4rec-bias
+  group: minionerec_reproduction_qwen05b
+  tags: [minionerec, reproduction, qwen0.5b, amazon23]
+  mode: online

@@ -1,0 +1,123 @@
+# =============================================================================
+# DPO4Rec × Qwen2.5-0.5B-Instruct × Amazon Reviews 2023
+#   arXiv 2410.05939 (ICME 2025) 复现；论文未开源
+#   LLM 生成偏好推理 → adaptor + reranker 重排 → ranked list
+#   reranker 同时是 reward model（用重排后的 NDCG@5 给推理文本打分）
+#
+#     bash prepare.sh EXP=dpo4rec_qwen05b_amazon STEPS=download,data
+#     EXP=dpo4rec_qwen05b_amazon bash run.sh
+#
+# ★ 这是 re-ranking，不是全库检索。ranked list 从候选集排出，所以
+#   coverage / exposure_gini 的分母和另两条路线不同（pop_lift / tier_hr 仍可比）。
+# ★ 原文没有 SFT，我们统一加了格式预热。要严格复现就把 stages 里的 sft 去掉。
+# =============================================================================
+
+defaults:
+  - base
+  - data/amazon23
+  - model/qwen2.5-0.5b-instruct
+  - bias/default
+
+experiment: {name: dpo4rec_qwen05b_amazon, route: dpo4rec, mode: integrated}
+seed: 42
+stages: [train_reranker, sft, eval, dpo, eval]
+
+data:
+  category: Industrial_and_Scientific
+  history_max_length: 25        # 论文 llm_max_history=25
+  max_train_samples: -1
+  max_eval_samples: -1
+
+hardware:
+  devices: auto
+  precision: auto
+  strategy: auto
+  memory: auto
+  gradient_checkpointing: true
+  deepspeed: null
+
+decoder:
+  name: knowledge_reranker
+  reranker:
+    kind: prm                   # dlcm | prm | setrank（论文对比了这三个）
+    hidden_dim: 128
+    num_heads: 4
+    num_layers: 2
+    dropout: 0.1
+    candidate_size: 20          # 待重排的候选列表长度
+    epochs: 20
+    learning_rate: 1.0e-3
+    batch_size: 256
+  knowledge_adaptor:
+    encoder: sentence-transformers/all-MiniLM-L6-v2   # 冻结
+    max_length: 512
+    output_dim: 64
+    trainable: true             # 只训 adaptor
+
+train:
+  sft:                          # 推理文本格式预热（按场景因子分条）
+    tasks: [preference_reasoning]
+    epochs: 1
+    max_steps: null
+    learning_rate: 1.0e-5
+    lr_scheduler_type: cosine
+    warmup_ratio: 0.03
+    weight_decay: 0.0
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    max_grad_norm: 1.0
+    per_device_batch_size: 2
+    gradient_accumulation_steps: 8
+    max_seq_length: 1024
+    logging_steps: 10
+    eval_steps: 200
+    load_best_model_at_end: false
+
+  dpo:
+    # 论文 Algorithm 1：迭代优化。实测 2 轮最好，第 3 轮因 DPO 过拟合退化。
+    iterations: 2
+    num_samples: 10             # 论文 N=10（消融 5→15，10 是性价比拐点）
+    sampling_temperature: 1.0
+    max_new_tokens: 512
+
+    eval_steps: 25
+    bias_eval_steps: 25
+    eval_examples: 256
+    logging_steps: 1
+
+    # —— 论文超参 ——
+    beta: 0.01                  # 论文明确写 default 0.01
+    epochs: 3                   # 论文 epoch=3
+    learning_rate: 5.0e-5       # 论文 AdamW lr=5e-5
+    gradient_accumulation_steps: 8   # 论文 grad accum=8
+    per_device_batch_size: 2    # 论文 batch size=2
+
+    lr_scheduler_type: cosine
+    warmup_ratio: 0.03
+    weight_decay: 0.0
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    max_grad_norm: 1.0
+    max_seq_length: 1024
+
+    loss_type: sigmoid
+    reference_free: false
+
+    reward:
+      metric: ndcg
+      top_k: 5                  # 论文用 NDCG@5 / MAP@5
+
+bias: {online_stages: [dpo], top_k: 10, final_examples: null, ips_gamma: 1.0}
+checkpoint: {save_stage_final: true, save_steps: 500, save_total_limit: 3}
+wandb:
+  enabled: true
+  project: llm4rec-bias
+  group: dpo4rec_qwen05b_amazon
+  tags: [dpo4rec, qwen0.5b, amazon23, prm]
+  mode: online
+
+evaluation:
+  top_k: [5, 10, 20]
+  metrics: [ndcg, hr, mrr]
