@@ -7,7 +7,6 @@ Upstream sources (``AkaliKong/MiniOneRec`` ``data.py``):
   - RL ``SidDataset`` / ``RLTitle2SidDataset`` / ``RLSeqTitle2SidDataset`` wraps
 
 Whitespace is intentional and must match byte-for-byte (tokenizer-sensitive).
-In particular, upstream places a trailing space after ``request.`` before ``\\n\\n``.
 """
 
 from __future__ import annotations
@@ -21,8 +20,7 @@ ALPACA_FUSION_INSTRUCTION = (
     "Can you recommend the next item for the user based on their interaction history?"
 )
 
-# Exact shared preamble from SidSFTDataset / SidItemFeat / FusionSeqRec ``pre()``.
-# NOTE: trailing space after "request." is required for upstream parity.
+# Shared preamble from SidSFTDataset / SidItemFeat / FusionSeqRec ``pre()``.
 _ALPACA_PREAMBLE = (
     "Below is an instruction that describes a task, paired with an input that "
     "provides further context. Write a response that appropriately completes "

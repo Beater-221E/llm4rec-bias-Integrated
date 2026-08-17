@@ -7,13 +7,20 @@
 三条路线的差别只在样本怎么构建（``llm4rec.data.examples``），
 训练循环、checkpoint 格式、日志全部共用。
 
+多卡默认跟 MiniOneRec GRPO 一样：按 rank 分片 + 手动 all-reduce 梯度，
+不包 DDP（V100 16GB 上 DDP bucket 会把 CE logits / Adam 挤爆）。
+只有显式 ``hardware.deepspeed`` 才走 HF Trainer。
+
 SFT 阶段【不做】bias 在线评测 —— 按研究设计，SFT 只提供一个基线，
 bias 的漂移观测放在 RL/DPO 阶段。stage 结束后会评一次基线。
 """
 
 from __future__ import annotations
 
+import inspect
 import json
+import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -27,6 +34,7 @@ from transformers import (
     TrainingArguments,
 )
 
+from llm4rec.core import distributed as dist_utils
 from llm4rec.core.exceptions import ConfigurationError
 
 IGNORE_INDEX = -100
@@ -293,6 +301,323 @@ def _resolve_deepspeed(cfg: dict[str, Any], logger: Any) -> dict[str, Any] | Non
     return ds_config
 
 
+def _shard_dataset(ds: Any) -> Any:
+    """Rank-strided view — same partition as ``dist_utils.shard`` / GRPO."""
+    if ds is None or not dist_utils.is_distributed():
+        return ds
+    from torch.utils.data import Subset
+
+    idxs = dist_utils.shard(list(range(len(ds))))
+    return Subset(ds, idxs)
+
+
+def _collate_to_device(
+    ds: Any,
+    indices: Sequence[int],
+    collator: PadCollator,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    feats = [ds[int(i)] for i in indices]
+    batch = collator(feats)
+    return {k: v.to(device) for k, v in batch.items()}
+
+
+@torch.no_grad()
+def _eval_sft_loss(
+    model: Any,
+    eval_ds: Any,
+    *,
+    collator: PadCollator,
+    device: torch.device,
+    runtime: Any,
+    per_device_batch: int,
+) -> float | None:
+    """Mean token-batch CE on this rank's eval shard, then all-reduce."""
+    from llm4rec.trainers.metrics_dist import reduce_scalar_pack
+
+    if eval_ds is None or len(eval_ds) == 0:
+        return None
+    model.eval()
+    total = 0.0
+    count = 0
+    bs = max(1, int(per_device_batch))
+    for start in range(0, len(eval_ds), bs):
+        idxs = list(range(start, min(start + bs, len(eval_ds))))
+        batch = _collate_to_device(eval_ds, idxs, collator, device)
+        with runtime.autocast():
+            out = model(**batch)
+            loss = out.loss if hasattr(out, "loss") else out["loss"]
+        total += float(loss.detach()) * len(idxs)
+        count += len(idxs)
+        del out, batch
+    packed = reduce_scalar_pack([total, float(count)], op="sum")
+    if packed[1] <= 0:
+        return None
+    return packed[0] / packed[1]
+
+
+def _run_sft_sharded(
+    *,
+    cfg: dict[str, Any],
+    sft_cfg: dict[str, Any],
+    model: Any,
+    tokenizer: Any,
+    train_ds: Any,
+    eval_ds: Any,
+    n_train_global: int,
+    n_eval_global: int,
+    output_dir: Path,
+    logger: Any,
+    stage: str,
+    runtime: Any,
+    batch_plan: Any,
+    collator: PadCollator,
+    precision: str,
+    reference_sft: bool,
+) -> dict[str, Any]:
+    """MiniOneRec-style data-parallel SFT: shard examples, no DDP wrap."""
+    from llm4rec.runtime.checkpointing import (
+        resolve_save_steps,
+        resolve_save_total_limit,
+        save_step_checkpoint,
+        should_save_at_step,
+    )
+    from llm4rec.runtime.profiler import make_timer, peak_vram_gb
+    from llm4rec.trainers.metrics_dist import reduce_scalar_pack
+    from llm4rec.trainers.schedulers import build_optimizer, create_scheduler
+
+    per_device_b = int(batch_plan.per_device_batch_size)
+    accum = int(batch_plan.gradient_accumulation_steps)
+    device = next(model.parameters()).device
+    train_ds = _shard_dataset(train_ds)
+    eval_ds = _shard_dataset(eval_ds) if eval_ds is not None else None
+
+    if not len(train_ds):
+        raise ConfigurationError(
+            f"rank {dist_utils.rank()} 分到 0 条 SFT 样本 —— 训练集比卡数还少"
+        )
+
+    max_steps_cfg = sft_cfg.get("max_steps")
+    if max_steps_cfg in (None, 0, "null"):
+        epochs = float(sft_cfg.get("epochs") or 1)
+        steps_per_epoch = max(
+            1, math.ceil(len(train_ds) / max(per_device_b, 1) / max(accum, 1))
+        )
+        max_steps = int(math.ceil(steps_per_epoch * epochs))
+    else:
+        max_steps = int(max_steps_cfg)
+        epochs = float(sft_cfg.get("epochs") or 1)
+
+    save_every = resolve_save_steps(cfg, sft_cfg, max_steps=max_steps, as_int=True)
+    if save_every is not None:
+        logger.info(
+            f"[sft] 中间 checkpoint：每 {save_every} step 存一次"
+            f"（最多保留 {resolve_save_total_limit(cfg)} 个）"
+        )
+
+    eval_steps = sft_cfg.get("eval_steps")
+    eval_every = (
+        int(eval_steps)
+        if eval_ds is not None and eval_steps not in (None, 0, "null", False)
+        else None
+    )
+    logging_steps = max(1, int(sft_cfg.get("logging_steps") or 10))
+
+    strategy = runtime.effective_strategy or runtime.strategy.strategy
+    train_core = runtime.maybe_compile(model, name="sft_policy")
+    if strategy == "fsdp" and runtime.world_size > 1:
+        train_model = runtime.wrap_model(train_core)
+    else:
+        train_model = train_core
+        if dist_utils.is_main() and dist_utils.is_distributed():
+            logger.info("[sft] skip DDP wrap; shard + manual grad allreduce")
+
+    if reference_sft and hasattr(train_model, "config"):
+        train_model.config.use_cache = False
+
+    optimizer, optim_fallback = build_optimizer(
+        [p for p in train_model.parameters() if p.requires_grad],
+        lr=float(sft_cfg.get("learning_rate") or 1e-5),
+        betas=(
+            float(sft_cfg.get("adam_beta1") or 0.9),
+            float(sft_cfg.get("adam_beta2") or 0.999),
+        ),
+        eps=float(sft_cfg.get("adam_epsilon") or 1e-8),
+        weight_decay=float(sft_cfg.get("weight_decay") or 0.0),
+        optim_name=sft_cfg.get("optim") or sft_cfg.get("optimizer"),
+    )
+    if optim_fallback and dist_utils.is_main():
+        logger.info(f"[sft] optimizer fallback: {optim_fallback}")
+    scheduler = create_scheduler(
+        optimizer,
+        scheduler_type=str(sft_cfg.get("lr_scheduler_type") or "cosine"),
+        num_training_steps=max_steps,
+        warmup_ratio=sft_cfg.get("warmup_ratio"),
+        warmup_steps=sft_cfg.get("warmup_steps"),
+    )
+    max_grad_norm = float(sft_cfg.get("max_grad_norm") or 1.0)
+
+    order = list(range(len(train_ds)))
+    if bool(sft_cfg.get("group_by_length", False)):
+        order.sort(key=lambda i: len(train_ds[i]["input_ids"]))
+
+    trainable = sum(p.numel() for p in train_model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in train_model.parameters())
+    logger.info(
+        f"[sft] 全参微调：可训练 {trainable / 1e6:.1f}M / 总计 {total / 1e6:.1f}M "
+        f"({100 * trainable / max(total, 1):.1f}%)  "
+        f"train={n_train_global} (rank {len(train_ds)}) eval={n_eval_global}  "
+        f"{dist_utils.summary_line()}"
+    )
+
+    timer = make_timer(cfg)
+    history: list[dict[str, Any]] = []
+    last_loss = 0.0
+    last_eval = None
+    cursor = 0
+    step = 0
+    t0 = time.perf_counter()
+    samples_seen = 0
+    optimizer.zero_grad(set_to_none=True)
+    train_model.train()
+    is_main = dist_utils.is_main()
+
+    while step < max_steps:
+        micro_loss = 0.0
+        for _ in range(accum):
+            idxs = []
+            for _ in range(per_device_b):
+                idxs.append(order[cursor % len(order)])
+                cursor += 1
+            batch = _collate_to_device(train_ds, idxs, collator, device)
+            with timer.phase("forward"):
+                with runtime.autocast():
+                    out = train_model(**batch)
+                    loss_raw = out.loss if hasattr(out, "loss") else out["loss"]
+                    loss = loss_raw / accum
+            with timer.phase("backward"):
+                runtime.backward(loss)
+            micro_loss += float(loss_raw.detach())
+            samples_seen += len(idxs)
+            del out, batch, loss, loss_raw
+
+        with timer.phase("optimizer"):
+            if not dist_utils.is_fsdp(train_model):
+                dist_utils.allreduce_gradients(train_model)
+            runtime.optimizer_step(
+                optimizer,
+                parameters=[p for p in train_model.parameters() if p.requires_grad],
+                max_grad_norm=max_grad_norm,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+        step += 1
+        last_loss = micro_loss / max(accum, 1)
+
+        should_log = step % logging_steps == 0 or step == max_steps
+        if should_log:
+            mean_loss = reduce_scalar_pack([last_loss])[0]
+            if is_main:
+                metrics = {
+                    "loss": mean_loss,
+                    "lr": float(scheduler.get_last_lr()[0]),
+                    "per_device_batch": float(per_device_b),
+                }
+                history.append({"step": step, **metrics})
+                logger.log_metrics(
+                    metrics,
+                    stage=stage,
+                    step=step,
+                    epoch=epochs * step / max(max_steps, 1),
+                    split="train",
+                    wandb_prefix="train",
+                )
+                logger.info(
+                    f"[sft] step={step}/{max_steps} loss={mean_loss:.4f} "
+                    f"lr={metrics['lr']:.2e}"
+                )
+
+        if eval_every is not None and step % eval_every == 0:
+            last_eval = _eval_sft_loss(
+                train_model,
+                eval_ds,
+                collator=collator,
+                device=device,
+                runtime=runtime,
+                per_device_batch=per_device_b,
+            )
+            train_model.train()
+            if last_eval is not None and is_main:
+                logger.log_metrics(
+                    {"loss": last_eval},
+                    stage=stage,
+                    step=step,
+                    split="eval",
+                    wandb_prefix="eval",
+                )
+                logger.info(f"[sft] eval step={step} loss={last_eval:.4f}")
+
+        if should_save_at_step(step, save_every):
+            save_step_checkpoint(
+                train_model,
+                output_dir,
+                step,
+                tokenizer=tokenizer,
+                cfg=cfg,
+                logger=logger,
+                tag=stage,
+            )
+
+    dist_utils.barrier("sft_end")
+    final_dir = Path(output_dir) / "final"
+    dist_utils.save_pretrained_distributed(
+        train_model, final_dir, tokenizer=tokenizer, is_main=is_main
+    )
+    if is_main:
+        (Path(output_dir) / "train_log.json").write_text(
+            json.dumps(history, indent=2) + "\n", encoding="utf-8"
+        )
+    dist_utils.barrier("sft_saved")
+
+    elapsed = max(1e-6, time.perf_counter() - t0)
+    perf: dict[str, Any] = {
+        "samples_per_sec": round(samples_seen * max(dist_utils.world_size(), 1) / elapsed, 3),
+        "optimizer_steps_per_sec": round(step / elapsed, 3),
+    }
+    vram = peak_vram_gb()
+    if vram is not None:
+        perf["peak_vram_gb"] = vram
+    phase = timer.summary()
+    if phase:
+        perf["phase_timers"] = phase
+    if perf:
+        cfg.setdefault("_performance", {})["sft"] = perf
+
+    metrics: dict[str, Any] = {
+        "train_loss": last_loss,
+        "train_runtime": elapsed,
+        "train_steps": step,
+    }
+    if last_eval is not None:
+        metrics["eval_loss"] = last_eval
+
+    logger.info(f"[sft] 完成，权重 → {final_dir}")
+    return {
+        "stage": stage,
+        "checkpoint": str(final_dir),
+        "metrics": metrics,
+        "n_train": n_train_global,
+        "n_eval": n_eval_global,
+        "trainable_params": trainable,
+        "total_params": total,
+        "batch_plan": batch_plan.to_dict(),
+        "strategy": runtime.effective_strategy,
+        "precision": precision,
+        "performance": perf or None,
+        "parallel": "shard_allreduce",
+    }
+
+
 def run_sft(
     *,
     cfg: dict[str, Any],
@@ -314,6 +639,8 @@ def run_sft(
     mode = str(cfg.get("mode") or (cfg.get("experiment") or {}).get("mode") or "integrated")
     route = str((cfg.get("experiment") or {}).get("route") or "")
     reference_sft = mode == "reproduction" and route == "minionerec"
+    n_train_global = len(train_examples)
+    n_eval_global = len(eval_examples or [])
 
     if reference_sft:
         from llm4rec.data.minionerec_sft import (
@@ -342,8 +669,6 @@ def run_sft(
     runtime.bind_model_params(model, stage="sft", log=logger.info)
 
     # Ensure each torchrun rank owns its LOCAL_RANK device before probe/train.
-    from llm4rec.core import distributed as dist_utils
-
     if torch.cuda.is_available():
         expected = torch.device(f"cuda:{dist_utils.local_rank()}")
         cur = next(model.parameters()).device
@@ -353,12 +678,36 @@ def run_sft(
 
     precision = runtime.precision.precision
     cfg["hardware"]["precision"] = precision
+    # AMP GradScaler cannot unscale FP16 parameter gradients. Keep master
+    # weights in FP32 when HF fp16 mixed precision is on.
+    if precision in ("fp16", "float16") and runtime.precision.grad_scaler:
+        if any(p.requires_grad and p.dtype == torch.float16 for p in model.parameters()):
+            model.float()
+            logger.info("[sft] FP16 权重已转为 FP32（AMP GradScaler 需要 FP32 master weights）")
     preferred = int(
         sft_cfg.get("preferred_per_device_batch_size")
         or sft_cfg.get("per_device_batch_size")
         or 2
     )
     hw_cfg = cfg.get("hardware") or {}
+    from llm4rec.runtime.activation_ckpt import resolve_activation_checkpointing
+
+    # Enable checkpointing *before* the memory probe. ``activation_checkpointing:
+    # auto`` used to ignore ``gradient_checkpointing: true`` and leave full
+    # activations on, which OOMs V100 16GB at seq=1024 / batch=2.
+    grad_ckpt, act_reason = resolve_activation_checkpointing(
+        hw_cfg,
+        preferred_micro=preferred,
+        selected_micro=preferred,
+        pressure_ratio=getattr(runtime.strategy, "pressure_ratio", None),
+        effective_strategy=runtime.effective_strategy or runtime.strategy.strategy,
+        strategy_source=getattr(runtime.strategy, "source", None),
+    )
+    if grad_ckpt and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        if hasattr(model, "config"):
+            model.config.use_cache = False
+        logger.info(f"[sft] gradient checkpointing on ({act_reason})")
     memory_auto = str(hw_cfg.get("memory") or "").lower() == "auto"
     pad_mult = ((cfg.get("optimization") or {}).get("generation") or {}).get("pad_to_multiple_of")
     pad_mult_i = int(pad_mult) if pad_mult not in (None, 0, "null", False) else None
@@ -403,6 +752,22 @@ def run_sft(
             while len(feats) < micro_b:
                 feats.append(feats[-1] if feats else train_ds[0])
             batch = collator(feats[:micro_b])
+            # Probe the training worst case (padded to max_seq_length), not a
+            # short 90th-percentile slice that later OOMs on long batches.
+            cur = int(batch["input_ids"].shape[1])
+            if cur < max_len:
+                pad_n = max_len - cur
+                pad_id = int(tokenizer.pad_token_id or tokenizer.eos_token_id or 0)
+                batch["input_ids"] = torch.nn.functional.pad(
+                    batch["input_ids"], (0, pad_n), value=pad_id
+                )
+                batch["attention_mask"] = torch.nn.functional.pad(
+                    batch["attention_mask"], (0, pad_n), value=0
+                )
+                if "labels" in batch:
+                    batch["labels"] = torch.nn.functional.pad(
+                        batch["labels"], (0, pad_n), value=IGNORE_INDEX
+                    )
             batch = {k: v.to(device) for k, v in batch.items()}
             model.train()
             with runtime.autocast():
@@ -439,13 +804,10 @@ def run_sft(
     for line in batch_plan.summary_lines():
         logger.info(f"[sft] {line}")
 
-    max_steps = sft_cfg.get("max_steps")
-
-    # DeepSpeed：HF Trainer 原生支持。Do NOT custom-wrap SFT.
+    # DeepSpeed still goes through HF Trainer (ZeRO). Default multi-GPU is
+    # MiniOneRec-style shard + manual allreduce — no DDP buckets.
     ds_config = _resolve_deepspeed(cfg, logger)
     effective = runtime.effective_strategy or runtime.strategy.strategy
-
-    from llm4rec.runtime.activation_ckpt import resolve_activation_checkpointing
 
     pressure = getattr(runtime.strategy, "pressure_ratio", None)
     if pressure is None and isinstance(hw_cfg.get("_memory_estimate"), dict):
@@ -458,6 +820,10 @@ def run_sft(
         effective_strategy=effective,
         strategy_source=getattr(runtime.strategy, "source", None),
     )
+    if grad_ckpt and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        if hasattr(model, "config"):
+            model.config.use_cache = False
     cfg.setdefault("hardware", {})["_activation_checkpointing_effective"] = grad_ckpt
     cfg.setdefault("hardware", {})["_activation_checkpointing"] = {
         "requested": hw_cfg.get("activation_checkpointing", "auto"),
@@ -465,16 +831,28 @@ def run_sft(
         "reason": act_reason,
     }
 
-    fsdp_arg: str | list[str] | bool = False
-    if ds_config is None and effective == "fsdp" and runtime.world_size > 1:
-        fsdp_arg = "full_shard auto_wrap"
-        logger.info("[sft] mapping effective strategy=fsdp → TrainingArguments.fsdp")
-    elif str(effective).startswith("deepspeed") and ds_config is None:
-        logger.warning(
-            f"[sft] strategy={effective} but hardware.deepspeed unset; "
-            "HF Trainer will use default DDP"
+    if ds_config is None:
+        return _run_sft_sharded(
+            cfg=cfg,
+            sft_cfg=sft_cfg,
+            model=model,
+            tokenizer=tokenizer,
+            train_ds=train_ds,
+            eval_ds=eval_ds,
+            n_train_global=n_train_global,
+            n_eval_global=n_eval_global,
+            output_dir=output_dir,
+            logger=logger,
+            stage=stage,
+            runtime=runtime,
+            batch_plan=batch_plan,
+            collator=collator,
+            precision=precision,
+            reference_sft=reference_sft,
         )
 
+    max_steps = sft_cfg.get("max_steps")
+    fsdp_arg: str | list[str] | bool = False
     warmup_kwargs: dict[str, Any] = {}
     if sft_cfg.get("warmup_steps") not in (None, "null", False):
         warmup_kwargs["warmup_steps"] = int(sft_cfg["warmup_steps"])
@@ -537,6 +915,12 @@ def run_sft(
         **_length_group_kwargs(sft_cfg),
         **warmup_kwargs,
         **_torch_compile_kwargs(cfg),
+        **(
+            {"ddp_find_unused_parameters": bool(runtime.find_unused_parameters)}
+            if "ddp_find_unused_parameters"
+            in inspect.signature(TrainingArguments.__init__).parameters
+            else {}
+        ),
     )
 
     callbacks: list[TrainerCallback] = [MetricsCallback(logger, stage)]
@@ -551,6 +935,7 @@ def run_sft(
         args=args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
+        processing_class=tokenizer,
         data_collator=collator,
         callbacks=callbacks,
     )
@@ -559,7 +944,8 @@ def run_sft(
     total = sum(p.numel() for p in model.parameters())
     logger.info(
         f"[sft] 全参微调：可训练 {trainable / 1e6:.1f}M / 总计 {total / 1e6:.1f}M "
-        f"({100 * trainable / max(total, 1):.1f}%)  train={len(train_ds)} eval={len(eval_ds or [])}"
+        f"({100 * trainable / max(total, 1):.1f}%)  "
+        f"train={n_train_global} (rank {len(train_ds)}) eval={n_eval_global}"
     )
     if reference_sft and hasattr(model, "config"):
         model.config.use_cache = False
@@ -567,8 +953,6 @@ def run_sft(
     result = trainer.train()
 
     final_dir = Path(output_dir) / "final"
-    # HF Trainer only writes on rank0; other ranks must not race into the next
-    # stage (eval) and load a half-written checkpoint.
     if dist_utils.is_main():
         trainer.save_model(str(final_dir))
         tokenizer.save_pretrained(str(final_dir))
@@ -578,7 +962,6 @@ def run_sft(
     dist_utils.barrier("sft_saved")
 
     perf = dict(throughput_cb.metrics) if throughput_cb.metrics else {}
-    # Prefer HF train_samples_per_second when available
     for k in ("train_samples_per_second", "train_steps_per_second"):
         if k in result.metrics:
             short = "samples_per_sec" if "samples" in k else "optimizer_steps_per_sec"
@@ -590,14 +973,15 @@ def run_sft(
         "stage": stage,
         "checkpoint": str(final_dir),
         "metrics": dict(result.metrics),
-        "n_train": len(train_ds),
-        "n_eval": len(eval_ds or []),
+        "n_train": n_train_global,
+        "n_eval": n_eval_global,
         "trainable_params": trainable,
         "total_params": total,
         "batch_plan": batch_plan.to_dict(),
         "strategy": runtime.effective_strategy,
         "precision": precision,
         "performance": perf or None,
+        "parallel": "deepspeed",
     }
     logger.info(f"[sft] 完成，权重 → {final_dir}")
     return summary

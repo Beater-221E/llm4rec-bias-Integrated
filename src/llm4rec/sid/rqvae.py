@@ -35,13 +35,8 @@ __all__ = [
 def sinkhorn(logits: torch.Tensor, epsilon: float, iters: int = 50) -> torch.Tensor:
     """Sinkhorn-Knopp soft assignment over the last dim (codebook).
 
-    ``logits`` is ``[B, K]`` (typically ``-distance``). Aligns with MiniOneRec's
-    ``sinkhorn_algorithm`` but accepts logits instead of distances.
-
-    Previous implementation transposed to ``[K, B]`` and used 1-D row/column
-    marginals; PyTorch broadcasting then turned ``r / q.sum(dim=1)`` into a
-    ``[K, K]`` tensor whenever ``B != K``, which is exactly the collision-group
-    case (small B, large codebook).
+    ``logits`` is ``[B, K]`` (typically ``-distance``). Same algorithm as
+    MiniOneRec ``sinkhorn_algorithm``, but takes logits instead of distances.
     """
     q = torch.exp(logits / epsilon)
     b, k = q.shape

@@ -210,7 +210,7 @@ Each run writes `execution_manifest.yaml` with **algorithm** knobs vs **actual_e
 | FSDP wrap → optimizer → full-state save; precision from RuntimeContext | **implemented** |
 | `memory:auto` (GRPO + SFT, representative shapes) | **implemented** |
 | Attention `sdpa` + eager fallback | **implemented** |
-| Length bucketing | **experimental_inactive** (`LengthBucketBatchSampler` present; not wired; use HF `group_by_length`) |
+| Length bucketing | **not implemented** (use HF `group_by_length` if needed) |
 | Static KV cache | **experimental** (Rec-R1 opt-in; MiniOneRec constrained gen stays dynamic; fallback updates effective) |
 | SID token init | **reference** resize-only in reproduction; optional `mean_noise` for integrated |
 | Multi-GPU validation | `scripts/validate_multi_gpu.sh` + `scripts/validate_runtime_matrix.py` |
@@ -386,18 +386,20 @@ configs/
 │   └── llama3.1-8b-instruct.yaml
 ├── sid/rqvae.yaml                RQ-VAE 参数 + SID 导入
 ├── bias/default.yaml             bias 指标集合
-├── deepspeed/                    zero2 / zero2_offload / zero3
-└── exp/                          ★ 实验配置，跑实验的人只看这里
-    ├── minionerec_qwen05b_amazon.yaml   ← 参数全部摊开，改哪个一目了然
+├── deepspeed/                    zero2 / zero2_offload / zero3（YAML，不是 JSON）
+├── route/minionerec/             MiniOneRec 共用层（common / integrated / reproduction）
+└── exp/                          ★ 实验入口，跑实验的人只看这里
+    ├── minionerec_qwen05b_amazon.yaml
     ├── recr1_qwen05b_amazon.yaml
     ├── dpo4rec_qwen05b_amazon.yaml
     ├── *_qwen7b_amazon.yaml             ← 薄覆盖，只写和 0.5B 不同的部分
     └── smoke_*.yaml                     ← 见附录
 ```
 
-三个 `*_qwen05b_amazon.yaml` 是**完全自包含**的：所有超参（含 Adam 的
-`beta1/beta2/epsilon`、`weight_decay`、`max_grad_norm`、`lr_scheduler_type`、
-`warmup_ratio`）都写在文件里，不依赖隐式默认值。想调什么直接搜。
+Rec-R1 / DPO4Rec 的 `*_qwen05b_amazon.yaml` 是自包含的（超参摊开在 exp 文件里）。
+MiniOneRec 会先加载 `configs/route/minionerec/*`，再被 exp 文件覆盖。
+想调什么直接搜对应 yaml。`EXP=` 必须是 `configs/exp/<name>.yaml` 的文件名
+（例如 `minionerec_qwen05b_amazon`），没有 `minionerec.yaml` 这种短名。
 
 ### RL 按 step 评测
 
@@ -430,12 +432,15 @@ runs/<数据集>/<route>/<模型>/seed_<seed>/<时间戳>/
 ├── sft/
 │   ├── final/              SFT 完的全参权重（可直接 RESUME_FROM）
 │   └── train_log.json
-├── rl/
-│   ├── final/              RL 完的全参权重
+├── rl/                     MiniOneRec / Rec-R1
+│   ├── final/
 │   └── train_log.json
+├── reranker/               DPO4Rec：第一阶段 reranker
+├── dpo/                    DPO4Rec：迭代 DPO
+│   └── final/
 └── eval/
     ├── eval_1.json         SFT 后的 bias 基线
-    ├── eval_2.json         RL 后的 bias
+    ├── eval_2.json         RL / DPO 后的 bias
     └── bias_delta.json     ★ 两者差值 = "RL 放大了多少 bias"
 ```
 
@@ -641,41 +646,23 @@ SID 构建、BM25、样本构建、bias 评测**全部不用改** —— 它们�
 
 ```
 src/llm4rec/
-├── core/
-│   ├── compose.py        分层配置组合 + 校验
-│   └── distributed.py    DDP 工具（手写训练循环的多卡支持）
-├── data/
-│   ├── base.py           DatasetAdapter 抽象 + 注册表 + 下载工具
-│   ├── amazon23.py       Amazon Reviews 2023
-│   ├── movielens.py      ML-1M / ML-100K
-│   └── examples.py       三条路线的样本构建
-├── sid/
-│   ├── artifact.py       静态产物契约（manifest / hash / 导入）
-│   ├── rqvae.py          RQ-VAE + RQ-Kmeans
-│   ├── embeddings.py     冻结 encoder 编码
-│   ├── table.py          SID 表 + 约束解码前缀树
-│   ├── model.py          带 SID 词表扩展的全参模型加载
-│   └── build.py          build-sid 编排
-├── decoders/             ★ 路线差异只在这里
-│   ├── constrained_beam.py     MiniOneRec
-│   ├── bm25_query.py           Rec-R1
-│   └── knowledge_reranker.py   DPO4Rec
-├── trainers/
-│   ├── sft.py            全参 SFT（+ DeepSpeed）
-│   ├── grpo.py           GRPO（MiniOneRec + Rec-R1 共用，DDP）
-│   ├── dpo.py            DPO + 论文的迭代优化（DDP）
-│   ├── rollouts.py       各路线的采样策略
-│   └── rewards.py        各路线的 reward（逐行对齐上游）
-├── retrieval/bm25.py     纯 Python BM25（含 Lucene 布尔语法）
+├── core/                 配置组合、分布式、异常、复现性
+├── data/                 DatasetAdapter + 三条路线的样本构建
+├── sid/                  SID 产物、RQ-VAE（integrated + MiniOneRec 官方）
+├── decoders/             ★ 路线差异只在这里（SID beam / BM25 / reranker）
+├── trainers/             SFT / GRPO / DPO / rollouts / rewards
+├── runtime/              精度、策略、batch、显存探测、checkpoint、KV cache
+├── retrieval/            纯 Python BM25
 ├── rerankers/            PRM / SetRank / DLCM + KnowledgeAdaptor
-├── eval/
-│   ├── catalog.py        物品目录 + 流行度分位 + 分层
-│   ├── bias.py           ★ 统一 bias 指标
-│   └── online.py         训练中在线评测
-├── tracking/             console + jsonl + wandb
-├── pipeline.py           stage 编排（SFT→eval→RL→eval）
+├── eval/                 统一 bias 指标 + 在线评测 + 多卡 gather
+├── tracking/             console + jsonl + wandb + 进度条
+├── compatibility/        上游 llm4rec-bias 指标桥
+├── kernels/              可选 Triton RQ distance（默认关）
+├── pipeline.py           stage 编排（SFT→eval→RL/DPO→eval）
 └── cli/main.py           CLI
 ```
+
+根目录 `workflow.ipynb` 是 Colab 安装附属，不是训练入口。
 
 ---
 
@@ -706,8 +693,9 @@ V100 上新增 embedding 在 fp16 下会发散，这是已知问题。用 `fp32`
 或换 A100/H100 用 `bf16`。
 
 **多卡启动就卡住不动**
-多半是 NCCL。`run.sh` 已经默认 disable 了 P2P/IB，如果还卡，试 `NCCL_DEBUG=INFO`
-看卡在哪一步。
+多半是 NCCL。默认**不**关 P2P/IB（让拓扑自检）。仅在 pre-Ampere GPU
+或设置 `LLM4REC_NCCL_COMPAT=1` 时才会 disable P2P/IB。如果还卡，试
+`NCCL_DEBUG=INFO` 看卡在哪一步。
 
 **`train/reward_std` 一直是 0**
 组内 reward 全一样 → advantage 全 0 → 这一组不产生梯度。GRPO 里这是正常现象

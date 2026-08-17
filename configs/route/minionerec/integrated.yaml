@@ -16,7 +16,7 @@ optimization:
 train:
   sft:
     tasks: [seqrec, title2sid, sid2title]
-    epochs: 3
+    epochs: 2
     learning_rate: 1.0e-5
     lr_scheduler_type: cosine
     warmup_ratio: 0.03
@@ -35,20 +35,36 @@ train:
     eval_examples: 256
     logging_steps: 1
     learning_rate: 1.0e-5
+    lr_scheduler_type: cosine
+    warmup_ratio: 0.03
     max_grad_norm: 0.3
     global_batch_size: 8
     per_device_batch_size: 1
     gradient_accumulation_steps: 8
     max_prompt_length: 512
+    reference_datasets:
+      sid_seq:
+        sample: -1
+      title_to_sid:
+        sample: -1
+      seq_title_to_sid:
+        sample: 10000
     grpo:
-      group_size: 16
+      group_size: 8
       beta: 1.0e-3
+      kl_loss_type: low_var_kl
       clip_epsilon: 0.2
       temperature: 1.0
       constrained_rollout: true
+      beam_search: true
+      do_sample: true
+      length_penalty: 0.0
       sync_ref_model: true
       ref_model_mixup_alpha: 0.6
       ref_model_sync_steps: 512
+      dapo: false
+      dynamic_sampling: false
     reward:
       type: ranking
+      implementation: minionerec_reference
       invalid_penalty: -1.0

@@ -25,6 +25,7 @@ from llm4rec.data.base import get_adapter
 from llm4rec.data.examples import build_auxiliary_examples, build_examples
 from llm4rec.eval.bias import bias_delta, compute_bias_metrics
 from llm4rec.eval.catalog import ItemCatalog
+from llm4rec.eval.gather import gather_ranked_results
 from llm4rec.eval.online import OnlineBiasEvaluator
 
 
@@ -81,7 +82,9 @@ class OnlineEvalHook:
 
     def _evaluate(self, step: int, model: Any, *, final: bool = False) -> None:
         try:
-            metrics = self.evaluator.evaluate(model, self.tokenizer)
+            metrics = self.evaluator.evaluate(
+                model, self.tokenizer, name=f"{self.stage}_step{step}"
+            )
         except Exception as exc:  # noqa: BLE001 — 评测失败不能带崩训练
             self.logger.warning(f"[bias] step {step} 在线评测失败：{exc}")
             return
@@ -334,15 +337,15 @@ class Pipeline:
 
     # ------------------------------------------------------------------- RL
     def run_rl(self, ctx: StageContext) -> dict[str, Any]:
-        from llm4rec.core.modes import get_mode
         from llm4rec.trainers.grpo import run_grpo
 
         model, tokenizer = self.load_model(ctx)
         ref_model, _ = self.load_model(ctx, frozen=True)
 
         rl_examples = ctx.train_examples
-        mode = get_mode(self.cfg)
-        if mode == "reproduction" and self.route == "minionerec" and ctx.sid_table is not None:
+        # Official rl.py ConcatDataset: Sid + RLTitle2Sid + RLSeqTitle2Sid.
+        # Used for both reproduction and integrated; only SID/SFT differ by mode.
+        if self.route == "minionerec" and ctx.sid_table is not None:
             from llm4rec.data.minionerec_rl import (
                 build_minionerec_reproduction_rl_train,
                 rl_dataset_counts,
@@ -366,7 +369,7 @@ class Pipeline:
                 seed=int(self.cfg.get("seed") or 42),
             )
             counts = rl_dataset_counts(rl_examples)
-            self.logger.info(f"[rl] MiniOneRec reproduction RL counts={counts}")
+            self.logger.info(f"[rl] MiniOneRec official RL mix counts={counts}")
             ctx.summaries.setdefault("rl_dataset_counts", counts)
 
         hook = self._build_online_hook(ctx, model, tokenizer, stage="rl")
@@ -416,8 +419,21 @@ class Pipeline:
             self.logger.info(
                 f"[{tag}] 评测 {len(examples)} 条（每 rank ≈{len(shard)}），top_k={top_k}"
             )
-        local = decoder.decode_batch(model, tokenizer, shard, top_k=top_k)
-        results = [r for bucket in dist_utils.all_gather_object(local) for r in (bucket or [])]
+        local = decoder.decode_batch(
+            model,
+            tokenizer,
+            shard,
+            top_k=top_k,
+            progress_total=len(examples),
+            progress_dir=self.run_dir / "eval" / "progress",
+            progress_name=tag,
+        )
+        results = gather_ranked_results(
+            local,
+            self.run_dir / "eval" / "shards",
+            name=tag,
+            timeout_s=float(bias_cfg.get("gather_timeout_s") or 8 * 3600),
+        )
         metrics = compute_bias_metrics(
             results,
             ctx.catalog,
@@ -482,6 +498,7 @@ class Pipeline:
             pool=pool,
             n_examples=n_examples,
             seed=int(self.cfg.get("seed") or 42),
+            shard_dir=self.run_dir / "eval" / "online_shards",
         )
         self.logger.info(
             f"[bias] 在线评测已启用：每 {bias_steps} step 评一次，"
@@ -549,20 +566,29 @@ class MiniOneRecPipeline(Pipeline):
         )
 
     def load_model(self, ctx: StageContext, *, frozen: bool = False) -> tuple[Any, Any]:
-        from llm4rec.sid.model import load_for_sid, load_trained
+        from llm4rec.sid.model import load_for_sid, load_trained, resolve_checkpoint
 
         runtime = self.runtime or ctx.runtime
         attn = runtime.attention_implementation() if runtime is not None else None
         lr = dist_utils.local_rank()
+        from llm4rec.runtime.precision import weight_dtype_name
+
+        if runtime is not None:
+            dtype_name = weight_dtype_name(runtime.precision, trainable=not frozen)
+        else:
+            dtype_name = str(self.cfg["hardware"].get("precision") or "fp32")
         if ctx.checkpoint:
             bundle = load_trained(
                 ctx.checkpoint,
-                dtype=str(self.cfg["hardware"].get("precision") or "fp32"),
+                dtype=dtype_name,
                 local_rank=lr,
                 attn_implementation=attn,
+                backbone=resolve_checkpoint(self.cfg["model"]),
+                sid_table=ctx.sid_table,
             )
         else:
             model_cfg = dict(self.cfg["model"])
+            model_cfg["dtype"] = dtype_name
             model_cfg["_experiment_mode"] = str(self.cfg.get("mode") or "integrated")
             bundle = load_for_sid(
                 model_cfg,
@@ -610,7 +636,13 @@ class MiniOneRecPipeline(Pipeline):
     def build_reward(self, ctx: StageContext) -> Any:
         from llm4rec.trainers.rewards import make_minionerec_reward
 
-        return make_minionerec_reward(ctx.sid_table, self.cfg["train"]["rl"])
+        # Official mix has reference_target_text, not always target_item.
+        # Default to upstream rule + ndcg_rule (rl.py reward_type=ranking).
+        rl_cfg = dict(self.cfg["train"]["rl"])
+        reward_cfg = dict(rl_cfg.get("reward") or {})
+        reward_cfg.setdefault("implementation", "minionerec_reference")
+        rl_cfg["reward"] = reward_cfg
+        return make_minionerec_reward(ctx.sid_table, rl_cfg)
 
 
 # ========================================================== 路线 2：Rec-R1
@@ -635,13 +667,19 @@ class RecR1Pipeline(Pipeline):
         runtime = self.runtime or ctx.runtime
         attn = runtime.attention_implementation() if runtime is not None else "sdpa"
         lr = dist_utils.local_rank()
-        dtype_name = str(self.cfg["hardware"].get("precision") or "fp32")
+        from llm4rec.runtime.precision import weight_dtype_name
+
+        if runtime is not None:
+            dtype_name = weight_dtype_name(runtime.precision, trainable=not frozen)
+        else:
+            dtype_name = str(self.cfg["hardware"].get("precision") or "fp32")
         if ctx.checkpoint:
             bundle = load_trained(
                 ctx.checkpoint,
                 dtype=dtype_name,
                 local_rank=lr,
                 attn_implementation=attn,
+                backbone=resolve_checkpoint(self.cfg["model"]),
             )
             model, tokenizer = bundle.model, bundle.tokenizer
         else:
@@ -727,14 +765,18 @@ class DPO4RecPipeline(Pipeline):
         ctx = super().build_context()
         # 给每条样本预生成固定的候选列表（固定 seed → 跨 step/跨 run 可比）
         rng = random.Random(int(self.cfg.get("seed") or 42))
-        for split in (ctx.train_examples, ctx.val_examples, ctx.test_examples):
-            for example in split:
-                candidates, pos = self.service.build_candidates(
-                    example, self.popularity, rng
-                )
-                example["_candidates"] = candidates
-                example["_target_pos"] = pos
-        self.logger.info("[reranker] 候选列表已固定（负例按流行度采样，固定 seed）")
+        queued = [*ctx.train_examples, *ctx.val_examples, *ctx.test_examples]
+        self.service.assign_candidates(
+            queued,
+            self.popularity,
+            rng,
+            desc="reranker/candidates",
+            logger=self.logger,
+        )
+        self.logger.info(
+            "[reranker] 候选列表已固定（KAR：最多 "
+            f"{self.service.n_positives} 个后续正例 + 未交互物品均匀负例，固定 seed）"
+        )
         return ctx
 
     def load_model(self, ctx: StageContext, *, frozen: bool = False) -> tuple[Any, Any]:
@@ -765,6 +807,7 @@ class DPO4RecPipeline(Pipeline):
         )
         out = self.run_dir / "reranker"
         self.service.save(out)
+        self.service.release_cuda()
         summary["path"] = str(out)
         self.logger.info(f"[reranker] 训练完成 → {out}")
         return summary
@@ -772,6 +815,7 @@ class DPO4RecPipeline(Pipeline):
     def run_dpo(self, ctx: StageContext) -> dict[str, Any]:
         from llm4rec.trainers.dpo import run_dpo
 
+        self.service.ensure_device()
         model, tokenizer = self.load_model(ctx)
         ref_model, _ = self.load_model(ctx, frozen=True)
         hook = self._build_online_hook(ctx, model, tokenizer, stage="dpo")

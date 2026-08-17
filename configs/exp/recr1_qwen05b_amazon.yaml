@@ -31,7 +31,7 @@ hardware:
   precision: auto
   strategy: auto
   memory: auto
-  gradient_checkpointing: true
+  gradient_checkpointing: true    # score+bwd 按组反传时压激活峰值
   deepspeed: null
 
 decoder:
@@ -90,6 +90,7 @@ train:
     rollout_batch_size: 32      # 原文 data.train_batch_size=32
     per_device_batch_size: 2    # 原文 ppo_micro_batch_size=2
     gradient_accumulation_steps: 8
+    generate_batch_size: 8      # 一次 generate 打包的 prompt 数（吞吐；不影响 G/全局 batch）
     max_prompt_length: 256      # 原文 data.max_prompt_length=256
     max_response_length: 512    # 原文 data.max_response_length=512
 

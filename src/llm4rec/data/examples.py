@@ -309,6 +309,15 @@ def build_examples(
             )
             if example is not None:
                 example["split"] = split
+                if route == "dpo4rec":
+                    n_pos = int(
+                        ((cfg.get("decoder") or {}).get("reranker") or {}).get(
+                            "n_positives"
+                        )
+                        or 4
+                    )
+                    # KAR ``rerank_item_from_hist``: next n interactions are relevant
+                    example["positive_items"] = items[pos : pos + n_pos]
                 out.append(example)
                 if limit is not None and len(out) >= limit:
                     return out

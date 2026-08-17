@@ -196,6 +196,10 @@ def build_minionerec_reproduction_rl_train(
     if 0 < n < len(seq_rows):
         seq_rows = rng.sample(seq_rows, n)
     out.extend(seq_rows)
+    # Official rl.py: Dataset.from_dict(...).shuffle(seed=seed).
+    # Without this, the first ~N_sid examples are all seqrec and title2sid
+    # (the dense-reward tasks) never appear until late in epoch 1.
+    rng.shuffle(out)
     return out
 
 

@@ -64,6 +64,20 @@ def test_compute_grpo_loss_finite():
     loss.backward()
 
 
+def test_low_var_kl_nonnegative_when_advantages_zero():
+    from llm4rec.trainers.grpo import low_var_kl
+
+    logp = torch.tensor([-1.2, -0.4, -2.0], requires_grad=True)
+    ref = torch.tensor([-1.0, -0.5, -1.5])
+    kl = low_var_kl(logp, ref)
+    assert float(kl) >= 0.0
+    loss, kls = compute_grpo_loss(
+        [logp], [ref], torch.zeros(1), beta=1e-3, clip_eps=0.2, kl_type="low_var_kl"
+    )
+    assert torch.isfinite(loss)
+    assert kls[0] >= 0.0
+
+
 def test_dpo_loss_finite():
     pc = torch.tensor([1.0])
     pr = torch.tensor([0.2])

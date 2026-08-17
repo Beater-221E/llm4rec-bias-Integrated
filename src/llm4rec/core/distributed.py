@@ -1,14 +1,16 @@
-"""分布式工具 —— 手写训练循环（GRPO / DPO）的多卡支持。
+"""分布式工具 —— 手写训练循环（SFT / GRPO / DPO）的多卡支持。
 
-背景：SFT 走 HF ``Trainer``，torchrun 下它自己会包 DDP、同步梯度、只让 rank0
-存盘。但 GRPO / DPO 是我们手写的循环，**必须自己处理这些**，否则 torchrun
-起 N 个进程就是 N 份互不同步的独立训练：梯度不聚合、各存各的 checkpoint、
-各开一个 wandb run —— 看起来在跑，其实结果是错的。
+默认并行是 MiniOneRec 的分片：各 rank 切不同样本，本地 backward 后
+``allreduce_gradients`` 平均梯度。不包 DDP，避免 V100 16GB 上 DDP bucket
+把 logits / Adam 挤爆。
+
+DeepSpeed ZeRO 仍走 HF Trainer；FSDP 仅在 ``strategy=fsdp`` 时 wrap。
 
 这里提供：
     * rank / world_size / is_main 查询
-    * ``wrap_ddp``      把模型包成 DDP，让 backward 自动 all-reduce 梯度
+    * ``wrap_ddp`` / ``wrap_fsdp``  可选包装（SFT/GRPO/DPO 默认不用 DDP）
     * ``shard``         按 rank 切分训练样本，各卡跑不同数据
+    * ``allreduce_gradients``  无 DDP 时的梯度平均
     * ``all_reduce_mean`` 汇总标量指标（loss / reward / kl）
     * ``barrier``       阶段同步
 """
@@ -227,6 +229,26 @@ def shard(items: Sequence[T]) -> list[T]:
     return [item for i, item in enumerate(items) if i % w == r]
 
 
+def allreduce_gradients(model: Any) -> None:
+    """Average grads without a second DDP forward (that path hung on V100).
+
+    Every trainable parameter participates, even if this rank has no grad
+    (zero-filled). Skipping ``None`` grads made ranks allreduce different
+    tensor counts and hung NCCL.
+    """
+    if not is_distributed():
+        return
+    core = unwrap(model)
+    world = world_size()
+    for p in core.parameters():
+        if not p.requires_grad:
+            continue
+        if p.grad is None:
+            p.grad = torch.zeros_like(p)
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        p.grad.div_(world)
+
+
 def all_reduce_mean(value: float) -> float:
     """跨卡求均值 —— 日志里的 loss/reward 应该是全局的，不是本卡的。"""
     if not is_distributed():
@@ -260,7 +282,9 @@ def all_gather_object(obj: Any) -> list[Any]:
 def summary_line() -> str:
     if not is_distributed():
         return "单卡"
-    return f"多卡 DDP：rank {rank()}/{world_size()} (local_rank={local_rank()})"
+    return (
+        f"多卡分片：rank {rank()}/{world_size()} (local_rank={local_rank()})"
+    )
 
 
 def print_distributed_banner(log=print) -> None:

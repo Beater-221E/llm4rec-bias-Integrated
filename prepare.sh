@@ -15,7 +15,7 @@
 set -euo pipefail
 
 # ───────────────────────────── 配置区 ─────────────────────────────
-EXP="${EXP:-minionerec}"          # 用哪个实验配置里的 data/ 和 sid/ 设定
+EXP="${EXP:-minionerec_qwen05b_amazon}"  # configs/exp/<EXP>.yaml
 GPUS="${GPUS:-0}"                 # 编码 + RQ-VAE 训练用哪张卡（单卡够）
 STEPS="${STEPS:-download,data,embed,sid,bm25}"   # 想跳过某步就删掉对应项
 FORCE="${FORCE:-0}"               # 1 = 即使产物已存在也重建

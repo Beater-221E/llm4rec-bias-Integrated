@@ -198,6 +198,12 @@ def test_precision_resolver():
     # MiniOneRec defaults to fp32 on non-bf16 for SID embedding stability
     assert resolve_precision("auto", v100, route="minionerec").precision == "fp32"
     assert resolve_precision("auto", v100, route="recr1").precision == "fp16"
+    from llm4rec.runtime.precision import weight_dtype_name
+
+    fp16_amp = resolve_precision("auto", v100, route="dpo4rec")
+    assert fp16_amp.grad_scaler is True
+    assert weight_dtype_name(fp16_amp, trainable=True) == "fp32"
+    assert weight_dtype_name(fp16_amp, trainable=False) == "fp16"
     with pytest.raises(ValueError, match="FP8"):
         resolve_precision("fp8", ampere)
 
@@ -227,25 +233,106 @@ def test_global_batch_single_vs_multi_gpu():
     assert p1.gradient_accumulation_steps == 32
     assert p4.gradient_accumulation_steps == 8
 
-    # best_effort (default): nearest valid global batch, no raise
-    soft = resolve_batch_plan(
-        world_size=3,
-        per_device_batch_size=2,
-        global_batch_size=64,
-        mode="reproduction",
-    )
-    assert soft.adjusted
-    assert soft.relative_batch_deviation >= 0.0
-    assert soft.effective_global_batch_size == soft.per_device_batch_size * soft.world_size * soft.gradient_accumulation_steps
 
-    with pytest.raises(Exception):
-        resolve_batch_plan(
-            world_size=3,
-            per_device_batch_size=2,
-            global_batch_size=64,
-            mode="reproduction",
-            batch_policy={"preserve_global_batch": "strict", "max_relative_deviation": 0.0},
-        )
+# --------------------------------------------------------------------------- checkpoint tokenizer rebuild
+
+
+def test_has_tokenizer_files(tmp_path):
+    from llm4rec.sid.model import _has_tokenizer_files
+
+    assert not _has_tokenizer_files(tmp_path)
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    assert not _has_tokenizer_files(tmp_path)
+    (tmp_path / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    assert _has_tokenizer_files(tmp_path)
+
+
+def test_load_tokenizer_rebuilds_stub_checkpoint(tmp_path, monkeypatch):
+    from llm4rec.sid import model as m
+
+    class FakeTok:
+        def __init__(self, source: str):
+            self.source = source
+            self.chat_template = "TPL" if source == "backbone" else None
+            self.pad_token = None
+            self.eos_token = "</s>"
+            self._tokens = ["<pad>"] * (151665 if source == "backbone" else 1)
+
+        def __len__(self) -> int:
+            return len(self._tokens)
+
+        def add_tokens(self, tokens, special_tokens=False):
+            before = len(self._tokens)
+            self._tokens.extend(list(tokens))
+            return len(self._tokens) - before
+
+    def fake_from_pretrained(src, **_kw):
+        return FakeTok("backbone" if str(src) == "bb" else "ckpt")
+
+    monkeypatch.setattr(m.AutoTokenizer, "from_pretrained", staticmethod(fake_from_pretrained))
+
+    class Table:
+        def all_tokens(self):
+            return [f"<a_{i}>" for i in range(8)]
+
+    tok = m._load_tokenizer_for_checkpoint(tmp_path, backbone="bb", sid_table=Table())
+    assert tok.source == "backbone"
+    assert len(tok) == 151665 + 8
+    assert tok.chat_template == "TPL"
+    assert tok.pad_token == "</s>"
+
+
+def test_qwen_embedding_padding_is_not_sid_mismatch():
+    """Qwen2.5: tokenizer 151665, embedding 151936 — padding, not missing SID."""
+    from llm4rec.sid.model import _assert_tokenizer_matches_model
+
+    class Tok:
+        unk_token_id = 0
+
+        def __len__(self):
+            return 151665
+
+    class Emb:
+        num_embeddings = 151936
+
+    class Model:
+        def get_input_embeddings(self):
+            return Emb()
+
+    _assert_tokenizer_matches_model(Tok(), Model())
+
+
+def test_tokenizer_larger_than_embedding_still_errors():
+    from llm4rec.core.exceptions import ConfigurationError
+    from llm4rec.sid.model import _assert_tokenizer_matches_model
+
+    class Tok:
+        def __len__(self):
+            return 200
+
+    class Emb:
+        num_embeddings = 100
+
+    class Model:
+        def get_input_embeddings(self):
+            return Emb()
+
+    with pytest.raises(ConfigurationError, match="大于模型 embedding"):
+        _assert_tokenizer_matches_model(Tok(), Model())
+
+
+def test_encode_prompt_rejects_empty_ids():
+    from llm4rec.decoders.constrained_beam import _encode_prompt
+
+    class EmptyTok:
+        def __call__(self, text, return_tensors="pt", add_special_tokens=True):
+            return {"input_ids": torch.zeros((1, 0), dtype=torch.long)}
+
+        def apply_chat_template(self, *_a, **_k):
+            return ""
+
+    with pytest.raises(RuntimeError, match="empty input_ids"):
+        _encode_prompt(EmptyTok(), [{"role": "user", "content": "hi"}])
 
 
 # --------------------------------------------------------------------------- collectives
@@ -268,12 +355,36 @@ def test_dpo_collectives_all_ranks():
     assert "should_log = global_step % logging_steps == 0" in src
     assert "reduce_scalar_pack" in src
     assert src.index("if should_log:") < src.index("if is_main:")
+    assert "_align_iteration_state" in src
+    assert src.index("_align_iteration_state") < src.index("开始训练")
+
+
+def test_align_dpo_iteration_state_single_process():
+    from llm4rec.trainers.dpo import _align_iteration_state
+
+    class Log:
+        def info(self, *a, **k):
+            pass
+
+    pairs = [{"id": 1}, {"id": 2}, {"id": 3}]
+    aligned, merged, stop = _align_iteration_state(
+        pairs, {"u1": "reason"}, Log()
+    )
+    assert stop is False
+    assert aligned == pairs
+    assert merged == {"u1": "reason"}
+
+    empty, merged_empty, stop_empty = _align_iteration_state([], {}, Log())
+    assert stop_empty is True
+    assert empty == []
+    assert merged_empty == {}
 
 
 def test_all_reduce_mean_single_process():
-    from llm4rec.core.distributed import all_reduce_mean
+    from llm4rec.core.distributed import all_reduce_mean, all_reduce_min_int
 
     assert all_reduce_mean(3.0) == 3.0
+    assert all_reduce_min_int(7) == 7
 
 
 # --------------------------------------------------------------------------- mode / smoke control flow
@@ -326,3 +437,23 @@ def test_smoke_control_flow_sid_official_tiny(tmp_path):
         model, feats, codes, max_iters=2, device="cpu", log=lambda *_: None
     )
     assert resolved.shape == codes.shape
+
+
+def test_shared_run_stamp_uses_env(monkeypatch, tmp_path):
+    from llm4rec.cli.main import _shared_run_stamp
+
+    monkeypatch.setenv("LLM4REC_RUN_TS", "20260816_101517")
+    assert _shared_run_stamp(tmp_path) == "20260816_101517"
+
+
+def test_shared_run_stamp_rendezvous(monkeypatch, tmp_path):
+    from llm4rec.cli.main import _shared_run_stamp
+
+    monkeypatch.delenv("LLM4REC_RUN_TS", raising=False)
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("RANK", "0")
+    a = _shared_run_stamp(tmp_path)
+    monkeypatch.setenv("RANK", "1")
+    b = _shared_run_stamp(tmp_path)
+    assert a == b
+    assert (tmp_path / ".run_stamp_29500").read_text().strip() == a

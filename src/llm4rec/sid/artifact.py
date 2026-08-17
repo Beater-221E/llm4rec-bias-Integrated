@@ -1,8 +1,7 @@
 """Semantic ID 的**静态产物**契约。
 
-旧版的毛病：SID 在 prepare / train 里按需构建，train 时发现缺了就偷偷重建
-（``workflows/minionerec/pipeline.py`` 的 ``prepare_data``）。后果是不同 run
-可能用着不同的 SID 表，而 SID 表一变，物品的语义前缀全变，
+旧版的毛病：SID 在 prepare / train 里按需构建，train 时发现缺了就偷偷重建。
+后果是不同 run 可能用着不同的 SID 表，而 SID 表一变，物品的语义前缀全变，
 bias 指标（尤其是 exposure / coverage）根本不可比 —— 这类问题还很难发现。
 
 新契约：

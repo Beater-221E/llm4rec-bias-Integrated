@@ -50,7 +50,7 @@ STAGES="${STAGES:-}"
 GPUS="${GPUS:-auto}"
 
 # DeepSpeed（只作用于 SFT 阶段）：留空 = 不用，用 DDP
-#   zero2 | zero2_offload | zero3   → configs/deepspeed/<name>.json
+#   zero2 | zero2_offload | zero3   → configs/deepspeed/<name>.yaml
 #   0.5B 全参单卡放得下，留空即可；3B+ 建议 zero2；7B+ 用 zero3
 #   ★ RL 阶段不走 DeepSpeed —— generate 在 ZeRO-3 下每步都要 gather 参数，会极慢
 DEEPSPEED="${DEEPSPEED:-}"
@@ -65,7 +65,7 @@ WANDB_ENTITY="${WANDB_ENTITY:-}"            # 你的 team；留空用个人默�
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"        # 留空自动生成 <exp>_<model>_seed<seed>_<ts>
 
 # —— 临时覆盖任意配置项（dotted key）——
-# 例：OVERRIDES=( "train.rl.max_steps=100" "bias.every_n_steps=20" )
+# 例：OVERRIDES=( "train.rl.max_steps=100" "train.rl.bias_eval_steps=20" )
 OVERRIDES=(
 )
 
@@ -98,6 +98,7 @@ fi
 OVERRIDES+=("$@")
 
 TS="$(date +%Y%m%d_%H%M%S)"
+export LLM4REC_RUN_TS="$TS"
 LOG_DIR="$ROOT/logs"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/${EXP}_${TS}.log"
