@@ -2,24 +2,24 @@
 
 ## Purpose
 
-Evaluate trained recommendation models using standard ranking metrics on a held-out test set to measure recommendation quality.
+Evaluate trained recommendation models with standard ranking metrics on held-out test set.
 
 ## Requirements
 
 ### Requirement: Evaluate ranking metrics at top-K
-The system SHALL compute Hit Rate (HR), Recall, NDCG, and MRR at configurable top-K values (default: 1, 5, 10) on the test split.
+System SHALL compute Hit Rate (HR), Recall, NDCG, MRR at configurable top-K (default: 1, 5, 10) on test split.
 
 #### Scenario: Ranking evaluation on test set
 - **WHEN** evaluation runs with `top_k=[1,5,10]` and `metrics=[hr, recall, ndcg, mrr]`
-- **THEN** the system outputs a report with each metric at each top-K value
+- **THEN** system outputs report with each metric at each top-K value
 
 #### Scenario: Smoke-scale evaluation
-- **WHEN** evaluation runs with `max_examples=null` (use all test users) under `scale=smoke`
-- **THEN** evaluation completes on the reduced test set (32 users)
+- **WHEN** evaluation runs with `max_examples=null` (all test users) under `scale=smoke`
+- **THEN** evaluation completes on reduced test set (32 users)
 
 ### Requirement: Use upstream evaluation interface
-The system SHALL support the `use_upstream_eval=true` flag to delegate evaluation to the upstream LLM evaluation framework.
+System SHALL support `use_upstream_eval=true` flag to delegate evaluation to upstream LLM evaluation framework.
 
 #### Scenario: Upstream evaluation enabled
 - **WHEN** `use_upstream_eval=true`
-- **THEN** evaluation metrics are computed by the upstream evaluation module rather than a custom implementation
+- **THEN** metrics computed by upstream evaluation module, not custom implementation

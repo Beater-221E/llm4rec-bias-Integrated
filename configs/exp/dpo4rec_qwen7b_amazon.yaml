@@ -2,11 +2,10 @@
 # dpo4rec × Qwen2.5-7B-Instruct × Amazon23
 # 只覆盖和 0.5B 版不同的地方，其余全部继承。
 #
-#     DEEPSPEED=zero3 GPUS=0,1,2,3,4,5,6,7 EXP=dpo4rec_qwen7b_amazon bash run.sh
+#     GPUS=0,1,2,3 EXP=dpo4rec_qwen7b_amazon bash run.sh
 #
-# 显存：7B 全参 fp32 单卡放不下 → SFT 必须 ZeRO-3。
-#       RL 阶段本框架走 DDP（ZeRO-3 下 generate 每步 gather 参数会极慢），
-#       所以 RL 需要单卡能放下 policy + ref = 2×7B，建议 bf16 + A100-80G。
+# 显存：7B 全参 bf16 + 优化器状态单卡放得下（B200 180GB）→ SFT/RL 均走 DDP。
+#       避开 ZeRO-3 的 NCCL allgather 挂起；4×B200 无 gather 开销。
 # =============================================================================
 
 defaults:
@@ -18,9 +17,14 @@ experiment: {name: dpo4rec_qwen7b_amazon}
 hardware:
   devices: "0,1,2,3,4,5,6,7"
   precision: bf16          # 7B 用 fp32 不现实；A100/H100 才有 bf16
+  strategy: ddp            # 强制 DDP，避开 auto 对 7B 选 fsdp
   gradient_checkpointing: true
-  deepspeed: zero3         # 只作用于 SFT
+  deepspeed: null          # DDP（null）
 
 wandb:
+  enabled: true
+  mode: online
+  project: llm4rec-bias
+  entity: dylan-li-dailin-university-of-virginia
   group: dpo4rec_qwen7b_amazon
   tags: [dpo4rec, qwen7b, amazon23]

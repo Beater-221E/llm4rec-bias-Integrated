@@ -196,6 +196,17 @@ class Pipeline:
             dist_utils.print_distributed_banner(self.logger.info)
             self.logger.info(f"[run] {dist_utils.summary_line()}")
         ctx = self.build_context()
+        # 续跑训练时导入先前基线，使末次 eval 仍能生成完整 bias_delta。
+        baseline_from = (self.cfg.get("bias") or {}).get("baseline_eval_from")
+        if baseline_from:
+            baseline_path = Path(str(baseline_from)).expanduser()
+            baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+            if not isinstance(baseline.get("metrics"), dict):
+                raise ConfigurationError(
+                    f"bias.baseline_eval_from 缺少 metrics：{baseline_path}"
+                )
+            ctx.eval_history.append(baseline)
+            self.logger.info(f"[eval] 已导入基线 → {baseline_path}")
         resume = self.cfg.get("resume_from")
         if resume:
             ctx.checkpoint = str(resume)
@@ -718,6 +729,12 @@ class DPO4RecPipeline(Pipeline):
 
         self.service = RerankerService(self.cfg, sorted(ctx.meta.keys()))
         self.popularity = dict(ctx.catalog.counts)
+        # 恢复已训练 reranker，避免续跑 eval/DPO 时重复训练。
+        load_from = self.service.rr_cfg.get("load_from")
+        if load_from:
+            checkpoint = Path(str(load_from)).expanduser()
+            self.service.load(checkpoint)
+            self.logger.info(f"[reranker] 已恢复 → {checkpoint}")
         self.logger.info(
             f"[reranker] {self.service.rr_cfg.get('kind', 'prm')} "
             f"候选列表长度 {self.service.candidate_size}"

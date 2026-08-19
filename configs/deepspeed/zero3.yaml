@@ -16,9 +16,8 @@ deepspeed_config:
     hysteresis: 2
     min_loss_scale: 1
 
-  optimizer:
-    type: AdamW
-    params: {lr: auto, betas: auto, eps: auto, weight_decay: auto}
+  # 不写 optimizer 段：让 HF Trainer 用 torch 原生 AdamW（zero_allow_untested_optimizer）。
+  # DeepSpeed 的 "AdamW" 实际是 FusedAdam（需 CUDA JIT 编译），会因工具链不匹配崩掉。
 
   zero_optimization:
     stage: 3

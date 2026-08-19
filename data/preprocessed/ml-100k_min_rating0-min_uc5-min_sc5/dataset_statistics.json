@@ -1,0 +1,11 @@
+{
+  "average_sequence_length": 147.99016393442622,
+  "has_meta_img_des": false,
+  "maximum_sequence_length": 2132,
+  "meta_size": 3650,
+  "minimum_sequence_length": 12,
+  "num_interactions": 90274,
+  "num_items": 3650,
+  "num_users": 610,
+  "sparsity": 0.9594547496070065
+}
