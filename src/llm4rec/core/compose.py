@@ -136,8 +136,9 @@ def compose(
 ) -> DictConfig:
     """组合出一份完整的运行时配置。
 
-    ``experiment`` 可以是 ``minionerec``（找 ``configs/exp/minionerec.yaml``）、
-    ``exp/minionerec``，或者一个直接的 yaml 路径。
+    ``experiment`` 可以是 ``minionerec_qwen05b_amazon``
+    （找 ``configs/exp/minionerec_qwen05b_amazon.yaml``）、
+    ``exp/minionerec_qwen05b_amazon``，或者一个直接的 yaml 路径。
     """
     root = config_root or configs_dir()
 

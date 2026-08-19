@@ -9,15 +9,15 @@
 
 子集用固定 seed 采样并且全程不变，所以不同 step 之间的曲线是可比的。
 
-多卡：把子集按 rank 切片，各自解码后 all-gather。
-不让 rank0 单独评（其它 rank 干等在 barrier 里会看起来像卡死，
-仓库里原来的 post-SFT eval 就是因为这个才被迫延后到训练结束）。
+多卡：把子集按 rank 切片，各自解码后写盘汇总（不用 NCCL all_gather）。
+不让 rank0 单独评（其它 rank 干等在 barrier 里会看起来像卡死）。
 """
 
 from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Sequence
 
 import torch
@@ -26,6 +26,7 @@ from transformers import TrainerCallback, TrainerControl, TrainerState, Training
 from llm4rec.decoders.base import Decoder
 from llm4rec.eval.bias import RankedResult, compute_bias_metrics
 from llm4rec.eval.catalog import ItemCatalog
+from llm4rec.eval.gather import gather_ranked_results
 
 
 @dataclass
@@ -39,6 +40,8 @@ class OnlineBiasEvaluator:
     ips_gamma: float = 1.0
     tier_thresholds: dict[str, float] | None = None
     enabled_metrics: list[str] | None = None
+    shard_dir: Path | None = None
+    gather_timeout_s: float = 8 * 3600
 
     @classmethod
     def from_config(
@@ -50,6 +53,7 @@ class OnlineBiasEvaluator:
         pool: Sequence[dict[str, Any]],
         n_examples: int | None = None,
         seed: int = 42,
+        shard_dir: Path | None = None,
     ) -> OnlineBiasEvaluator:
         bias_cfg = cfg.get("bias") or {}
         n = int(n_examples or bias_cfg.get("online_examples") or 256)
@@ -65,22 +69,37 @@ class OnlineBiasEvaluator:
             ips_gamma=float(bias_cfg.get("ips_gamma") or 1.0),
             tier_thresholds=dict(bias_cfg.get("tiers") or {}) or None,
             enabled_metrics=list(bias_cfg.get("metrics") or []) or None,
+            shard_dir=Path(shard_dir) if shard_dir is not None else None,
+            gather_timeout_s=float(bias_cfg.get("gather_timeout_s") or 8 * 3600),
         )
 
-    def evaluate(self, model: Any, tokenizer: Any) -> dict[str, Any]:
+    def evaluate(
+        self, model: Any, tokenizer: Any, *, name: str = "online"
+    ) -> dict[str, Any]:
         shard = _shard_for_rank(self.examples)
         was_training = bool(getattr(model, "training", False))
         model.eval()
         try:
             with torch.no_grad():
+                progress_dir = None
+                if self.shard_dir is not None:
+                    progress_dir = Path(self.shard_dir).parent / "progress"
                 local = self.decoder.decode_batch(
-                    model, tokenizer, shard, top_k=self.top_k
+                    model,
+                    tokenizer,
+                    shard,
+                    top_k=self.top_k,
+                    progress_total=len(self.examples),
+                    progress_dir=progress_dir,
+                    progress_name=name,
                 )
         finally:
             if was_training:
                 model.train()
 
-        results = _gather_results(local)
+        results = _gather_results(
+            local, shard_dir=self.shard_dir, name=name, timeout_s=self.gather_timeout_s
+        )
         return compute_bias_metrics(
             results,
             self.catalog,
@@ -140,7 +159,9 @@ class BiasEvalCallback(TrainerCallback):
             return
         tok = self.tokenizer
         try:
-            metrics = self.evaluator.evaluate(model, tok)
+            metrics = self.evaluator.evaluate(
+                model, tok, name=f"{self.stage}_step{step}"
+            )
         except Exception as exc:  # noqa: BLE001
             # 在线评测挂了不能把训练带崩 —— 记一笔继续训
             self.logger.warning(f"[bias] step {step} 在线评测失败：{exc}")
@@ -182,15 +203,19 @@ def _shard_for_rank(examples: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     return [ex for i, ex in enumerate(examples) if i % world == rank]
 
 
-def _gather_results(local: list[RankedResult]) -> list[RankedResult]:
+def _gather_results(
+    local: list[RankedResult],
+    *,
+    shard_dir: Path | None,
+    name: str,
+    timeout_s: float,
+) -> list[RankedResult]:
     """把各 rank 的结果收拢到一起（每张卡都拿到完整列表）。"""
-    rank, world = _dist_info()
-    if world <= 1:
-        return local
-    buckets: list[Any] = [None] * world
-    torch.distributed.all_gather_object(buckets, local)
-    out: list[RankedResult] = []
-    for bucket in buckets:
-        if bucket:
-            out.extend(bucket)
-    return out
+    if shard_dir is None:
+        rank, world = _dist_info()
+        if world <= 1:
+            return local
+        raise RuntimeError("online eval 多卡必须提供 shard_dir，不能再用 NCCL all_gather")
+    return gather_ranked_results(
+        local, shard_dir, name=name, timeout_s=timeout_s
+    )

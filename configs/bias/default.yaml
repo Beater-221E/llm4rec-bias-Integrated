@@ -13,12 +13,8 @@
 bias:
   # 在哪些 stage 评。sft 不在列表里 = SFT 训练中不评（只在 stage 结束评一次基线）。
   online_stages: [rl, dpo]
-  # ★ 在线评测频率不在这里配，在 train.<stage>.bias_eval_steps 里配
+  # ★ 在线评测频率在 train.<stage>.bias_eval_steps 里配
   #   （留 null 就跟随 train.<stage>.eval_steps）。
-  #   原因：RL 是按 step 跑的，评测频率是 per-stage 的训练参数，
-  #   放在 bias 这个跨 stage 共享的层里会互相打架。
-  #   下面这个只是兜底默认值。
-  every_n_steps: 50
   # 在线评测用的固定 held-out 子集大小（固定 seed 采样，跨 step 可比）；
   # train.<stage>.eval_examples 会覆盖它
   online_examples: 256

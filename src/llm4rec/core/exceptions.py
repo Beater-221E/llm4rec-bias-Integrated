@@ -21,9 +21,5 @@ class InvalidGenerationError(LabError):
     """Model output failed the shared strict parser."""
 
 
-class EvaluatorCompatibilityError(LabError):
-    """Upstream eval adapter received incomplete or mismatched inputs."""
-
-
 class MissingArtifactError(LabError):
     """Expected run artifact (data, config, predictions) is missing."""

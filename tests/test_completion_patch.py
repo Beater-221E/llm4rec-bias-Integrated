@@ -1,4 +1,4 @@
-"""Final targeted completion tests — exact prompts, SID init, runtime, KV, FSDP."""
+"""SID token init, runtime strategy, KV cache, and profiler wiring."""
 
 from __future__ import annotations
 
@@ -10,22 +10,6 @@ import pytest
 import torch
 import torch.nn as nn
 
-from llm4rec.data.minionerec_prompts import (
-    ALPACA_FUSION_INSTRUCTION,
-    ALPACA_ITEMFEAT_INSTRUCTION,
-    ALPACA_SFT_INSTRUCTION,
-    format_minionerec_alpaca_prompt,
-    format_minionerec_rl_prompt,
-    fusion_prompt,
-    sid2title_prompt,
-    sid_sft_prompt,
-    title2sid_prompt,
-)
-from llm4rec.data.minionerec_rl import (
-    rl_seq_title2sid_example,
-    rl_title2sid_examples,
-    sid_rl_example,
-)
 from llm4rec.runtime.activation_ckpt import resolve_activation_checkpointing
 from llm4rec.runtime.hardware import HardwareInfo
 from llm4rec.runtime.kv_cache import KVCacheChoice, persist_kv_choice, resolve_kv_cache
@@ -35,173 +19,6 @@ from llm4rec.runtime.memory_estimate import (
 )
 from llm4rec.runtime.strategy import resolve_strategy
 from llm4rec.sid.model import initialize_added_tokens, resolve_sid_token_initialization
-
-
-# ---------------------------------------------------------------------------
-# Upstream-derived golden strings (pinned MiniOneRec @ 0c64b955)
-# Transcribed from data.py — NOT from local formatters.
-# ---------------------------------------------------------------------------
-
-# SidSFTDataset.pre instruction + BaseDataset.generate_prompt(empty output)
-UPSTREAM_SID_SFT = (
-    "Below is an instruction that describes a task, paired with an input that "
-    "provides further context. Write a response that appropriately completes "
-    "the request. \n\n"
-    "### Instruction:\n"
-    "Can you predict the next possible item that the user may expect?\n\n"
-    "### User Input: \n"
-    "The user has interacted with items <a_1><b_2><c_3> in chronological order. "
-    "Can you predict the next possible item that the user may expect?\n\n"
-    "### Response:\n"
-)
-
-UPSTREAM_TITLE2SID = (
-    "Below is an instruction that describes a task, paired with an input that "
-    "provides further context. Write a response that appropriately completes "
-    "the request. \n\n"
-    "### Instruction:\n"
-    "Answer the question about item identification.\n\n"
-    "### User Input: \n"
-    "Which item has the title: Book?\n\n"
-    "### Response:\n"
-)
-
-UPSTREAM_SID2TITLE = (
-    "Below is an instruction that describes a task, paired with an input that "
-    "provides further context. Write a response that appropriately completes "
-    "the request. \n\n"
-    "### Instruction:\n"
-    "Answer the question about item identification.\n\n"
-    "### User Input: \n"
-    'What is the title of item "<a_1><b_2><c_3>"?\n\n'
-    "### Response:\n"
-)
-
-UPSTREAM_FUSION = (
-    "Below is an instruction that describes a task, paired with an input that "
-    "provides further context. Write a response that appropriately completes "
-    "the request. \n\n"
-    "### Instruction:\n"
-    "Can you recommend the next item for the user based on their interaction history?\n\n"
-    "### User Input: \n"
-    "The user has sequentially interacted with items <a_1><b_2><c_3>. "
-    "Can you recommend the next item for him? Tell me the title of the item\n\n"
-    "### Response:\n"
-)
-
-UPSTREAM_RL_SID = (
-    "### User Input: \n"
-    "The user has interacted with items <a_1><b_2><c_3> in chronological order. "
-    "Can you predict the next possible item that the user may expect?\n\n"
-    "### Response:\n"
-)
-
-UPSTREAM_RL_TITLE = (
-    "### User Input: \n"
-    "Which item has the title: Book?\n\n"
-    "### Response:\n"
-)
-
-UPSTREAM_RL_DESC = (
-    "### User Input: \n"
-    'An item can be described as follows: "A long story". Which item is it describing?\n\n'
-    "### Response:\n"
-)
-
-UPSTREAM_RL_SEQ = (
-    "### User Input: \n"
-    'Given the title sequence of user historical interactive items: "A", "B", '
-    "can you recommend a suitable next item for the user?\n\n"
-    "### Response:\n"
-)
-
-
-class DeterministicTokenizer:
-    """Maps whitespace-delimited tokens to stable IDs."""
-
-    def __init__(self) -> None:
-        self.bos_token_id = 1
-        self.eos_token_id = 2
-        self._vocab: dict[str, int] = {"<bos>": 1, "<eos>": 2}
-        self._next = 10
-
-    def encode(self, text: str) -> list[int]:
-        ids: list[int] = []
-        for tok in text.split(" "):
-            if tok not in self._vocab:
-                self._vocab[tok] = self._next
-                self._next += 1
-            ids.append(self._vocab[tok])
-        return ids
-
-    def __call__(self, text: str, add_special_tokens: bool = False, **kwargs):
-        return {"input_ids": self.encode(text)}
-
-
-def test_minionerec_sid_sft_prompt_exact():
-    assert sid_sft_prompt(["<a_1><b_2><c_3>"]) == UPSTREAM_SID_SFT
-
-
-def test_minionerec_sid_item_feat_title_to_sid_prompt_exact():
-    assert title2sid_prompt("Book") == UPSTREAM_TITLE2SID
-
-
-def test_minionerec_sid_item_feat_sid_to_title_prompt_exact():
-    assert sid2title_prompt("<a_1><b_2><c_3>") == UPSTREAM_SID2TITLE
-
-
-def test_minionerec_fusion_seq_prompt_exact():
-    assert fusion_prompt(["<a_1><b_2><c_3>"]) == UPSTREAM_FUSION
-
-
-def test_minionerec_rl_sid_prompt_exact():
-    ex = sid_rl_example(
-        history_sids=["<a_1><b_2><c_3>"], target_sid="<a_9><b_9><c_9>"
-    )
-    assert ex["prompt"] == UPSTREAM_RL_SID
-
-
-def test_minionerec_rl_title_to_sid_prompt_exact():
-    assert format_minionerec_rl_prompt("Which item has the title: Book?") == UPSTREAM_RL_TITLE
-
-
-def test_minionerec_rl_description_to_sid_prompt_exact():
-    assert (
-        format_minionerec_rl_prompt(
-            'An item can be described as follows: "A long story". Which item is it describing?'
-        )
-        == UPSTREAM_RL_DESC
-    )
-
-
-def test_minionerec_rl_seq_title_to_sid_prompt_exact():
-    ex = rl_seq_title2sid_example(
-        history_titles=["A", "B"], target_sid="<a_9><b_9><c_9>"
-    )
-    assert ex["prompt"] == UPSTREAM_RL_SEQ
-
-
-def test_minionerec_sft_exact_upstream_whitespace():
-    # Trailing space after "request." must be present
-    body = format_minionerec_alpaca_prompt(ALPACA_SFT_INSTRUCTION, "x")
-    assert "completes the request. \n\n### Instruction:" in body
-    assert "completes the request.\n\n### Instruction:" not in body
-
-
-def test_minionerec_rl_exact_upstream_whitespace():
-    p = format_minionerec_rl_prompt("hello")
-    assert p == "### User Input: \nhello\n\n### Response:\n"
-
-
-def test_minionerec_reference_token_ids():
-    tok = DeterministicTokenizer()
-    prompt = sid_sft_prompt(["<a_1><b_2><c_3>"])
-    assert prompt == UPSTREAM_SID_SFT
-    ids = tok.encode(prompt)
-    expected = tok.encode(UPSTREAM_SID_SFT)
-    assert ids == expected
-    # Stable across re-encode
-    assert tok.encode(prompt) == expected
 
 
 def test_reproduction_sid_tokens_use_resize_initialization():
@@ -465,6 +282,17 @@ def test_activation_checkpointing_auto_memory_driven():
         hw, preferred_micro=16, selected_micro=16, pressure_ratio=0.8
     )
     assert on2 and reason3 == "memory_pressure"
+    on3, reason4 = resolve_activation_checkpointing(
+        {
+            "activation_checkpointing": "auto",
+            "gradient_checkpointing": True,
+            "activation_checkpointing_auto": {},
+        },
+        preferred_micro=16,
+        selected_micro=16,
+        pressure_ratio=0.2,
+    )
+    assert on3 and reason4 == "explicit_gradient_checkpointing"
 
 
 def test_static_cache_success_reports_static():

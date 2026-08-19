@@ -54,6 +54,9 @@ hardware:
   gradient_checkpointing: true
   # 0.5B 全参单卡放得下，DDP 就够，不必上 DeepSpeed。
   deepspeed: null
+  # generate 前卸回 CPU；打分时再短时搬上 GPU（见 _score_logprobs）。
+  reference_model:
+    strategy: cpu_offload
 
 # ─────────────────────────── 训练 ───────────────────────────
 train:
@@ -61,7 +64,7 @@ train:
   sft:
     tasks: [seqrec, title2sid, sid2title]   # 官方的多任务混合
 
-    epochs: 3
+    epochs: 2
     max_steps: null                # 非 null 时优先于 epochs
 
     learning_rate: 1.0e-5
@@ -86,10 +89,11 @@ train:
     early_stopping_patience: null
 
   # ---------------------------------------------------------------- RL
+  # 对齐官方 rl.sh → rl.py（AkaliKong/MiniOneRec），唯一例外：G=8（官方 16）。
   rl:
     algorithm: grpo
 
-    epochs: 2                      # 官方 rl.sh: num_train_epochs=2
+    epochs: 2                      # 官方 --num_train_epochs 2
     max_steps: null
 
     # ★ RL 按 step 走，评测频率也按 step 配
@@ -98,35 +102,51 @@ train:
     eval_examples: 256             # 在线评测的固定 held-out 子集（不落 checkpoint）
     logging_steps: 1
 
-    learning_rate: 1.0e-5          # 官方 rl.sh: --learning_rate 1e-5
-    lr_scheduler_type: constant
-    warmup_ratio: 0.0
+    learning_rate: 1.0e-5          # 官方 --learning_rate 1e-5
+    lr_scheduler_type: cosine      # 官方 GRPOConfig lr_scheduler_type=cosine
+    warmup_ratio: 0.03             # 官方 warmup_ratio=0.03
     weight_decay: 0.0
     adam_beta1: 0.9
     adam_beta2: 0.999
     adam_epsilon: 1.0e-8
-    max_grad_norm: 0.3
+    max_grad_norm: 0.3             # 官方 max_grad_norm=0.3
 
     per_device_batch_size: 1
     gradient_accumulation_steps: 8
-    global_batch_size: 8       # 保持跨卡数一致的有效全局 batch
+    global_batch_size: 8           # V100-16GB；官方 8 卡 × 64/16 × accum 2
     max_prompt_length: 512
 
+    # 官方 rl.py ConcatDataset(Sid, RLTitle2Sid, RLSeqTitle2Sid)
+    reference_datasets:
+      sid_seq:
+        sample: -1
+      title_to_sid:
+        sample: -1
+      seq_title_to_sid:
+        sample: 10000
+
     grpo:
-      group_size: 16               # 官方 --num_generations 16
-      beta: 1.0e-3                 # 官方 --beta 1e-3（KL 系数）
+      group_size: 8                # ★ 唯一相对官方的改动（官方 --num_generations 16）
+      beta: 1.0e-3                 # 官方 --beta 1e-3
+      kl_loss_type: low_var_kl     # 官方 ReReTrainer: exp(ref-logπ)-(ref-logπ)-1
       clip_epsilon: 0.2
       temperature: 1.0             # 官方 --temperature 1.0
       updates_per_rollout: 1
       advantage_normalization: group
-      constrained_rollout: true    # 官方 --beam_search True
+      constrained_rollout: true
+      beam_search: true            # 官方 --beam_search True
+      do_sample: true
+      length_penalty: 0.0
       sync_ref_model: true         # 官方 --sync_ref_model True
+      ref_model_mixup_alpha: 0.6
+      ref_model_sync_steps: 512
       dapo: false                  # 官方 --dapo False
-      dynamic_sampling: false
+      dynamic_sampling: false      # 官方 --dynamic_sampling False
 
     reward:
       # 官方 reward_type="ranking" = [rule_reward, ndcg_rule_reward]
       type: ranking
+      implementation: minionerec_reference
       invalid_penalty: -1.0
       # ★ 不加任何 bias 惩罚项 —— 要观测的正是"纯准确率 reward 会不会放大 bias"
 
@@ -142,7 +162,6 @@ checkpoint:
   save_stage_final: true    # 每个 stage 结束存一份完整权重
   save_steps: 500           # 训练中每隔 N step 存中间 checkpoint（null 关闭）
   save_total_limit: 3
-  save_optimizer_state: false
 
 # ─────────────────────────── wandb ───────────────────────────
 wandb:

@@ -84,6 +84,38 @@ def _pad_to_multiple(cfg: dict[str, Any]) -> int | None:
     return int(v) if v not in (None, 0, "null", False) else None
 
 
+def _align_iteration_state(
+    pairs: list[dict[str, Any]],
+    best_reasoning: dict[str, str],
+    logger: Any,
+) -> tuple[list[dict[str, Any]], dict[str, str], bool]:
+    """Make every rank train the same number of steps and share reasonings.
+
+    Sampling is sharded, so ranks can build different pair counts. The rank
+    that finishes first then hits ``barrier("dpo_end")`` (1-elem allreduce)
+    while another rank is still in ``allreduce_gradients`` (embedding grads).
+    That is the DPO4Rec 2-GPU hang after reranker refill.
+
+    Truncate to the global minimum pair count and merge ``best_reasoning``
+    so refill sees the same texts on every rank.
+    """
+    n_local = len(pairs)
+    n_keep = dist_utils.all_reduce_min_int(n_local)
+    gathered = dist_utils.all_gather_object(dict(best_reasoning))
+    merged: dict[str, str] = {}
+    for chunk in gathered:
+        if chunk:
+            merged.update(chunk)
+    if dist_utils.is_distributed() and n_local != n_keep and dist_utils.is_main():
+        logger.info(
+            f"[dpo] 各 rank 偏好对数量不一致（本卡 {n_local}），"
+            f"对齐到 {n_keep}，避免 NCCL 步数错位"
+        )
+    if n_keep <= 0:
+        return [], merged, True
+    return pairs[:n_keep], merged, False
+
+
 def _maybe_activation_checkpoint(
     model: Any,
     runtime: Any,
@@ -214,7 +246,14 @@ def run_dpo(
 
     base_model = model
     train_core = runtime.maybe_compile(model, name="dpo_policy")
-    train_model = runtime.wrap_model(train_core)
+    # Same as GRPO: shard examples + manual allreduce. DDP buckets OOM on V100 16GB.
+    strategy = runtime.effective_strategy or runtime.strategy.strategy
+    if strategy == "fsdp" and runtime.world_size > 1:
+        train_model = runtime.wrap_model(train_core)
+    else:
+        train_model = train_core
+        if dist_utils.is_main() and dist_utils.is_distributed():
+            logger.info("[dpo] skip DDP wrap; shard + manual grad allreduce")
     from llm4rec.trainers.schedulers import build_optimizer, create_scheduler
 
     optimizer, optim_fallback = build_optimizer(
@@ -282,34 +321,47 @@ def run_dpo(
         logger.info(f"[dpo] 迭代 {iteration}/{iterations}：采样 N={n_samples} 并打分")
         pairs: list[dict[str, Any]] = []
         base_model.eval()
-        for idx, example in enumerate(local_examples):
-            prompt_ids, completions, texts = sample_reasonings(
-                base_model,
-                tokenizer,
-                example,
-                n=n_samples,
-                temperature=temperature,
-                max_new_tokens=max_new_tokens,
-                use_cache=use_cache,
-            )
-            scores = score_fn(example, texts)
-            if len(set(scores)) < 2:
-                continue
-            best = max(range(len(scores)), key=lambda i: scores[i])
-            worst = min(range(len(scores)), key=lambda i: scores[i])
-            pairs.append(
-                {
-                    "prompt_ids": prompt_ids,
-                    "chosen": completions[best],
-                    "rejected": completions[worst],
-                    "score_gap": scores[best] - scores[worst],
-                }
-            )
-            best_reasoning[str(example.get("user_id") or "")] = texts[best]
-            if idx % 200 == 0 and idx:
-                logger.info(f"[dpo]   采样 {idx}/{len(local_examples)}，已得 {len(pairs)} 对")
+        from llm4rec.tracking.progress import overwrite_progress
 
-        if not pairs:
+        with overwrite_progress(
+            len(local_examples),
+            f"dpo/sample-{iteration}",
+            global_total=len(train_examples),
+            progress_dir=Path(output_dir) / "progress",
+            name=f"dpo_sample_{iteration}",
+            log_interval_s=5.0,
+        ) as progress:
+            for example in local_examples:
+                prompt_ids, completions, texts = sample_reasonings(
+                    base_model,
+                    tokenizer,
+                    example,
+                    n=n_samples,
+                    temperature=temperature,
+                    max_new_tokens=max_new_tokens,
+                    use_cache=use_cache,
+                )
+                scores = score_fn(example, texts)
+                if len(set(scores)) < 2:
+                    progress.update(1)
+                    continue
+                best = max(range(len(scores)), key=lambda i: scores[i])
+                worst = min(range(len(scores)), key=lambda i: scores[i])
+                pairs.append(
+                    {
+                        "prompt_ids": prompt_ids,
+                        "chosen": completions[best],
+                        "rejected": completions[worst],
+                        "score_gap": scores[best] - scores[worst],
+                    }
+                )
+                best_reasoning[str(example.get("user_id") or "")] = texts[best]
+                progress.update(1)
+
+        pairs, best_reasoning, stop = _align_iteration_state(
+            pairs, best_reasoning, logger
+        )
+        if stop:
             logger.warning(f"[dpo] 迭代 {iteration} 没有构造出任何偏好对，提前结束")
             break
         logger.info(f"[dpo] 迭代 {iteration}：{len(pairs)} 个偏好对，开始训练")
@@ -371,6 +423,8 @@ def run_dpo(
                     continue
 
                 with timer.phase("optimizer"):
+                    if not dist_utils.is_fsdp(train_model):
+                        dist_utils.allreduce_gradients(train_model)
                     runtime.optimizer_step(
                         optimizer,
                         parameters=[p for p in train_model.parameters() if p.requires_grad],
@@ -429,6 +483,7 @@ def run_dpo(
 
         if on_iteration_end is not None:
             on_iteration_end(iteration, dict(best_reasoning))
+        dist_utils.barrier(f"dpo_iter_{iteration}_end")
 
     for callback in callbacks:
         hook = getattr(callback, "on_train_end", None)

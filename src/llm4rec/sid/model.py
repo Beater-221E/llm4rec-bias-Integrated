@@ -11,6 +11,7 @@ SID token 加成**普通 token**（``special_tokens=False``），因为 TRL 的 
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,17 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 
 from llm4rec.core.exceptions import ConfigurationError, MissingArtifactError
 from llm4rec.sid.table import SidTable
+
+_LOG = logging.getLogger(__name__)
+
+_TOKENIZER_MARKERS = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
+    "spiece.model",
+    "tokenizer.model",
+)
+_STUB_VOCAB_THRESHOLD = 1000
 
 _DTYPES = {
     "fp32": torch.float32,
@@ -199,12 +211,100 @@ def _freeze_except_embeddings(model: PreTrainedModel) -> None:
         out.weight.requires_grad = True
 
 
+def _restore_chat_template(tokenizer: Any, backbone: str | Path | None) -> None:
+    """HF mid-checkpoints often drop chat_template; copy it back from backbone."""
+    if getattr(tokenizer, "chat_template", None) or not backbone:
+        return
+    src = AutoTokenizer.from_pretrained(backbone)
+    if getattr(src, "chat_template", None):
+        tokenizer.chat_template = src.chat_template
+
+
+def _has_tokenizer_files(path: Path) -> bool:
+    return any((path / name).is_file() for name in _TOKENIZER_MARKERS)
+
+
+def _load_tokenizer_for_checkpoint(
+    path: Path,
+    *,
+    backbone: str | Path | None = None,
+    sid_table: SidTable | None = None,
+) -> Any:
+    """Load tokenizer from a full save, or rebuild from backbone + SID tokens.
+
+    HF Trainer mid-checkpoints often keep weights only. ``from_pretrained`` on
+    that directory yields a stub Qwen tokenizer (vocab size 1); encoding then
+    produces empty ``input_ids`` and beam search crashes.
+    """
+    source = path if _has_tokenizer_files(path) else None
+    if source is None and backbone:
+        source = backbone
+        _LOG.info("checkpoint %s 没有 tokenizer 文件，从 backbone 重建：%s", path, backbone)
+    if source is None:
+        raise MissingArtifactError(
+            f"checkpoint {path} 没有 tokenizer 文件，且未提供 backbone"
+        )
+
+    tokenizer = AutoTokenizer.from_pretrained(source)
+    if len(tokenizer) < _STUB_VOCAB_THRESHOLD:
+        if not backbone or Path(str(backbone)) == Path(str(source)):
+            raise MissingArtifactError(
+                f"tokenizer vocab={len(tokenizer)}，无法从 {source} 恢复"
+            )
+        _LOG.warning(
+            "checkpoint tokenizer vocab=%d，视为空壳，改从 backbone 加载：%s",
+            len(tokenizer),
+            backbone,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(backbone)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    _restore_chat_template(tokenizer, backbone)
+    if sid_table is not None:
+        n_added = tokenizer.add_tokens(sid_table.all_tokens(), special_tokens=False)
+        if n_added:
+            _LOG.info("已补 %d 个 SID token，tokenizer vocab=%d", n_added, len(tokenizer))
+    return tokenizer
+
+
+def _assert_tokenizer_matches_model(
+    tokenizer: Any,
+    model: PreTrainedModel,
+    *,
+    sid_table: SidTable | None = None,
+) -> None:
+    """Tokenizer must not be larger than the embedding matrix.
+
+    Qwen2.5 keeps unused padding rows (e.g. 151665 tokens vs 151936 embeddings).
+    That gap is hardware padding, not missing SID tokens. SID presence is checked
+    separately when ``sid_table`` is provided.
+    """
+    n_tok = len(tokenizer)
+    n_emb = int(model.get_input_embeddings().num_embeddings)
+    if n_tok > n_emb:
+        raise ConfigurationError(
+            f"tokenizer vocab {n_tok} 大于模型 embedding {n_emb}"
+        )
+    if sid_table is not None:
+        missing = [
+            tok
+            for tok in sid_table.all_tokens()
+            if tokenizer.convert_tokens_to_ids(tok) in (None, tokenizer.unk_token_id)
+        ]
+        if missing:
+            raise ConfigurationError(
+                f"SID token 不在 tokenizer 词表里（例：{missing[:3]}）"
+            )
+
+
 def load_trained(
     checkpoint_dir: str | Path,
     *,
     dtype: str = "fp32",
     local_rank: int = 0,
     attn_implementation: str | None = None,
+    backbone: str | Path | None = None,
+    sid_table: SidTable | None = None,
 ) -> SidModelBundle:
     """加载我们自己存的全参 checkpoint（SID token 已经在里面了）。
 
@@ -215,9 +315,9 @@ def load_trained(
     if not path.is_dir():
         raise MissingArtifactError(f"checkpoint 目录不存在：{path}")
 
-    tokenizer = AutoTokenizer.from_pretrained(path)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = _load_tokenizer_for_checkpoint(
+        path, backbone=backbone, sid_table=sid_table
+    )
     load_kwargs: dict[str, Any] = {"dtype": resolve_dtype(dtype)}
     if attn_implementation:
         load_kwargs["attn_implementation"] = str(attn_implementation)
@@ -226,8 +326,12 @@ def load_trained(
     except Exception:
         load_kwargs["attn_implementation"] = "eager"
         model = AutoModelForCausalLM.from_pretrained(path, **load_kwargs)
+    _assert_tokenizer_matches_model(tokenizer, model, sid_table=sid_table)
     if torch.cuda.is_available():
         model = model.to(f"cuda:{local_rank}")
+    new_ids = []
+    if sid_table is not None:
+        new_ids = [tokenizer.convert_tokens_to_ids(t) for t in sid_table.all_tokens()]
     return SidModelBundle(
-        tokenizer=tokenizer, model=model, new_token_ids=[], n_new_tokens=0
+        tokenizer=tokenizer, model=model, new_token_ids=new_ids, n_new_tokens=0
     )

@@ -11,6 +11,7 @@ from llm4rec.trainers.logprobs import (
     batched_multi_prompt_logprobs,
     batched_pair_logprobs,
     batched_sequence_logprobs,
+    logprob_chunk_size,
     score_preference_batch,
     sequence_logprobs,
 )
@@ -28,6 +29,34 @@ class TinyLM(nn.Module):
             input_ids = kwargs.get("input_ids")
         h = self.embed(input_ids)
         return type("O", (), {"logits": self.out(h)})()
+
+
+def test_logprob_chunk_size_caps_sid_vocab():
+    # 16 × 544 × 153201 fp32 ≈ 5.3 GiB; 512 MiB budget → chunk 1
+    assert logprob_chunk_size(16, 544, 153201) == 1
+    assert logprob_chunk_size(8, 64, 32) == 8
+
+
+def test_chunked_logprobs_match_full_batch():
+    torch.manual_seed(0)
+    model = TinyLM()
+    model.eval()
+    prompts = [torch.randint(0, 32, (n,)) for n in (4, 5, 3, 6)]
+    comps = [torch.randint(0, 32, (n,)) for n in (2, 6, 4, 3)]
+    with torch.no_grad():
+        full = batched_multi_prompt_logprobs(model, prompts, comps, pad_token_id=0)
+        chunked = batched_multi_prompt_logprobs(
+            model, prompts, comps, pad_token_id=0
+        )
+        # force 1-row chunks via private kw by going through _score_padded_batch
+        from llm4rec.trainers.logprobs import _score_padded_batch
+
+        forced = _score_padded_batch(
+            model, prompts, comps, pad_token_id=0, max_chunk=1
+        )
+    for a, b, c in zip(full, chunked, forced):
+        assert torch.allclose(a, b, atol=1e-5)
+        assert torch.allclose(a, c, atol=1e-5)
 
 
 def test_batched_multi_prompt_matches_sequential():
@@ -128,6 +157,17 @@ def test_batch_policy_best_effort_and_strict():
     from llm4rec.runtime.batch import resolve_batch_plan
     import pytest
 
+    p1 = resolve_batch_plan(
+        world_size=1, per_device_batch_size=2, global_batch_size=64, mode="integrated"
+    )
+    p4 = resolve_batch_plan(
+        world_size=4, per_device_batch_size=2, global_batch_size=64, mode="integrated"
+    )
+    assert p1.effective_global_batch_size == 64
+    assert p4.effective_global_batch_size == 64
+    assert p1.gradient_accumulation_steps == 32
+    assert p4.gradient_accumulation_steps == 8
+
     soft = resolve_batch_plan(
         world_size=3,
         per_device_batch_size=2,
@@ -187,8 +227,117 @@ def test_execution_manifest_shape():
                 "effective_strategy": "ddp",
             },
         },
-        "train": {"sft": {"global_batch_size": 64}, "rl": {"global_batch_size": 8}},
+        "train": {
+            "sft": {
+                "global_batch_size": 64,
+                "objectives": ["sid_sft", "sid_item_feat", "fusion_seqrec"],
+            },
+            "rl": {
+                "global_batch_size": 8,
+                "grpo": {"group_size": 16, "do_sample": True, "temperature": 1.0},
+            },
+        },
     }
     m = build_execution_manifest(cfg)
-    assert "algorithm" in m and "execution" in m
+    assert "algorithm" in m and "execution" in m and "hardware" in m
     assert m["algorithm"]["sid"]["rqvae_seed"] == 2024
+    refs = m.get("reference_semantics") or {}
+    if refs:
+        assert refs.get("do_sample") is True
+        assert refs.get("sft_objectives", [None])[0] == "sid_sft"
+
+
+def test_move_optimizer_state_cpu_and_back():
+    from llm4rec.trainers.grpo import _move_optimizer_state
+
+    model = nn.Linear(4, 4)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    model(torch.ones(2, 4)).sum().backward()
+    opt.step()
+    _move_optimizer_state(opt, "cpu")
+    for state in opt.state.values():
+        for value in state.values():
+            if torch.is_tensor(value):
+                assert value.device.type == "cpu"
+    _move_optimizer_state(opt, torch.device("cpu"))
+
+
+def test_generation_mode_restores_train_and_cache():
+    from llm4rec.trainers.grpo import _generation_mode
+
+    class _Cfg:
+        use_cache = False
+
+    class _M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = nn.Linear(2, 2)
+            self.config = _Cfg()
+            self.is_gradient_checkpointing = True
+            self._gc = True
+
+        def gradient_checkpointing_disable(self):
+            self._gc = False
+
+        def gradient_checkpointing_enable(self):
+            self._gc = True
+
+    model = _M()
+    model.train()
+    with _generation_mode(model) as core:
+        assert core.training is False
+        assert core.config.use_cache is True
+        assert core._gc is False
+    assert model.training is True
+    assert model.config.use_cache is False
+    assert model._gc is True
+
+
+def test_scheduler_warmup_then_cosine():
+    from llm4rec.trainers.schedulers import create_scheduler
+
+    model = nn.Linear(4, 4)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    sched = create_scheduler(
+        opt, scheduler_type="cosine", num_training_steps=20, warmup_steps=5
+    )
+    lrs = []
+    for _ in range(20):
+        opt.step()
+        sched.step()
+        lrs.append(sched.get_last_lr()[0])
+    assert lrs[0] < lrs[4]
+    assert lrs[-1] < lrs[5]
+
+
+def test_deepspeed_effective_falls_back_for_custom_wrap():
+    from llm4rec.runtime.context import build_runtime
+
+    cfg = {
+        "mode": "reproduction",
+        "experiment": {"route": "minionerec", "mode": "reproduction"},
+        "hardware": {
+            "precision": "fp32",
+            "strategy": "zero2",
+            "memory": "none",
+            "deepspeed": None,
+        },
+        "optimization": {"compile": {"enabled": False}},
+    }
+    rt = build_runtime(cfg, log=lambda *_: None)
+    rt.effective_strategy = "deepspeed_zero2"
+    rt.resolved_strategy = "deepspeed_zero2"
+    rt.strategy.strategy = "deepspeed_zero2"
+    model = nn.Linear(2, 2)
+    wrapped = rt.wrap_model(model)
+    assert "deepspeed" not in str(rt.effective_strategy)
+    assert rt.fallback_reason == "custom_grpo_deepspeed_backend_not_implemented"
+    assert wrapped is model or hasattr(wrapped, "module")
+
+
+def test_fsdp_wrap_respects_fp32():
+    from llm4rec.core import distributed as dist_utils
+
+    m = nn.Linear(2, 2)
+    out = dist_utils.wrap_fsdp(m, param_dtype=None, reduce_dtype=None, buffer_dtype=None)
+    assert out is m

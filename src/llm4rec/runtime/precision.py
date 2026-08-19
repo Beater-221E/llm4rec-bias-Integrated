@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
+import torch
+
 from llm4rec.runtime.hardware import HardwareInfo
 
 
@@ -75,3 +77,27 @@ def resolve_precision(
     if allow_fp16:
         return PrecisionChoice(precision="fp16", amp=True, grad_scaler=True, source="auto")
     return PrecisionChoice(precision="fp32", amp=False, grad_scaler=False, source="auto")
+
+
+def weight_dtype_name(choice: PrecisionChoice, *, trainable: bool = True) -> str:
+    """Dtype used when *loading* weights.
+
+    HF ``fp16=True`` / GradScaler requires FP32 master weights. Loading the
+    module in float16 and then enabling the scaler raises
+    ``ValueError: Attempting to unscale FP16 gradients``. Frozen / inference
+    copies may stay in fp16 to save VRAM.
+    """
+    if choice.precision == "bf16":
+        return "bf16"
+    if choice.precision == "fp16" and (not trainable or not choice.grad_scaler):
+        return "fp16"
+    return "fp32"
+
+
+def weight_dtype(choice: PrecisionChoice, *, trainable: bool = True) -> torch.dtype:
+    name = weight_dtype_name(choice, trainable=trainable)
+    return {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+    }[name]

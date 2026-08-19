@@ -19,20 +19,18 @@ from llm4rec.trainers.grpo import Rollout
 
 
 def make_minionerec_reward(sid_table: Any, cfg: dict[str, Any]):
-    """MiniOneRec reward. ``implementation: minionerec_reference`` (default for
-    reproduction) matches upstream ``rl.py`` rule + ndcg_rule; ``integrated``
-    keeps the SID-parse experimental variant.
+    """MiniOneRec reward.
+
+    Default matches upstream ``rl.py`` ``reward_type=ranking`` (rule + ndcg_rule
+    on target text). The SID-parse experimental variant is opt-in via
+    ``implementation: integrated`` / ``sid_parse``.
     """
     reward_cfg = cfg.get("reward") or {}
     implementation = str(
         reward_cfg.get("implementation") or cfg.get("reward_implementation") or ""
     ).lower()
     kind = str(reward_cfg.get("type") or "ranking")
-    if implementation == "minionerec_reference" or (
-        not implementation
-        and str((cfg.get("mode") or (cfg.get("experiment") or {}).get("mode") or "")).lower()
-        == "reproduction"
-    ):
+    if implementation not in {"integrated", "sid_parse"}:
         return make_minionerec_reference_reward(cfg, kind=kind)
 
     invalid_penalty = float(reward_cfg.get("invalid_penalty") or -1.0)

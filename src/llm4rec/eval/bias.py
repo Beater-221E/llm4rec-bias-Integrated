@@ -57,6 +57,25 @@ class RankedResult:
         except ValueError:
             return None
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "user_id": self.user_id,
+            "ranked_items": list(self.ranked_items),
+            "target_item": self.target_item,
+            "history": list(self.history),
+            "valid": bool(self.valid),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> RankedResult:
+        return cls(
+            user_id=str(raw.get("user_id") or ""),
+            ranked_items=[str(x) for x in (raw.get("ranked_items") or [])],
+            target_item=str(raw.get("target_item") or ""),
+            history=[str(x) for x in (raw.get("history") or [])],
+            valid=bool(raw.get("valid", True)),
+        )
+
 
 def compute_bias_metrics(
     results: Sequence[RankedResult],

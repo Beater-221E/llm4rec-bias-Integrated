@@ -44,7 +44,8 @@ decoder:
     num_heads: 4
     num_layers: 2
     dropout: 0.1
-    candidate_size: 20          # 待重排的候选列表长度
+    candidate_size: 10          # KAR rerank_list_len；论文评 NDCG@5 / MAP@5
+    n_positives: 4              # KAR rerank_item_from_hist：后续交互作正例
     epochs: 20
     learning_rate: 1.0e-3
     batch_size: 256

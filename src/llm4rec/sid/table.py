@@ -74,16 +74,12 @@ class SidTable:
                 path,
             )
 
-        # Backward-compatible single-item view (deterministic first item).
-        self.item_of: dict[tuple[int, ...], str] = {
-            sid: items[0] for sid, items in self.sid_to_items.items()
-        }
-
         self._pattern = re.compile(
             r"<(" + "|".join(re.escape(p) for p in self.prefixes) + r")_(\d+)>"
         )
         self._ambiguity_count = 0
         self._ambiguity_logged: set[tuple[int, ...]] = set()
+        self._trie_cache: dict[tuple[int, int], tuple[dict, dict[int, list[int]]]] = {}
 
     # ------------------------------------------------------------------ 编解码
     def sid(self, item_id: str | int) -> str:
@@ -160,14 +156,43 @@ class SidTable:
         return []
 
     # ------------------------------------------------------------- 约束解码
+    def cached_trie(self, tokenizer: Any, eos_id: int) -> tuple[dict, dict[int, list[int]]]:
+        """Build the SID prefix trie once per (tokenizer, eos)."""
+        key = (id(tokenizer), int(eos_id))
+        hit = self._trie_cache.get(key)
+        if hit is not None:
+            return hit
+        _LOG.info("building SID prefix trie (%d items)…", len(self.codes))
+        root = self.build_trie(tokenizer, eos_id)
+        allowed: dict[int, list[int]] = {}
+
+        def index(node: dict) -> None:
+            kids = list(node.keys())
+            allowed[id(node)] = kids
+            for child in node.values():
+                index(child)
+
+        index(root)
+        packed = (root, allowed)
+        self._trie_cache[key] = packed
+        _LOG.info("SID prefix trie ready (%d nodes)", len(allowed))
+        return packed
+
     def build_trie(self, tokenizer: Any, eos_id: int) -> dict:
         """全库 SID 的 token 前缀树，叶子挂 eos。"""
         root: dict = {}
+        token_ids: dict[tuple[int, int], int] = {}
         for codes in self.codes.values():
-            ids = [
-                tokenizer.convert_tokens_to_ids(sid_token(layer, code, self.prefixes))
-                for layer, code in enumerate(codes)
-            ]
+            ids = []
+            for layer, code in enumerate(codes):
+                key = (layer, int(code))
+                tid = token_ids.get(key)
+                if tid is None:
+                    tid = tokenizer.convert_tokens_to_ids(
+                        sid_token(layer, code, self.prefixes)
+                    )
+                    token_ids[key] = tid
+                ids.append(tid)
             if any(i is None or i < 0 for i in ids):
                 raise ConfigurationError(
                     "SID token 不在 tokenizer 词表里 —— "
@@ -181,19 +206,27 @@ class SidTable:
 
     def prefix_allowed_fn(self, tokenizer: Any, prompt_len: int, eos_id: int):
         """给 ``model.generate(prefix_allowed_tokens_fn=...)`` 用。"""
-        root = self.build_trie(tokenizer, eos_id)
+        root, allowed = self.cached_trie(tokenizer, eos_id)
 
         def fn(batch_id: int, input_ids: Any) -> list[int]:
             _ = batch_id
             node = root
-            for token_id in input_ids[prompt_len:].tolist():
-                node = node.get(token_id)
+            generated = input_ids[prompt_len:]
+            if hasattr(generated, "tolist"):
+                generated = generated.tolist()
+            for token_id in generated:
+                node = node.get(int(token_id))
                 if node is None:
                     return [eos_id]
-            allowed = list(node.keys())
-            return allowed or [eos_id]
+            return allowed.get(id(node)) or [eos_id]
 
         return fn
+
+    def constraint_processor(self, tokenizer: Any, prompt_len: int, eos_id: int):
+        """One LogitsProcessor call per decode step (not per beam)."""
+        from llm4rec.sid.constraint import SidPrefixLogitsProcessor
+
+        return SidPrefixLogitsProcessor(self, tokenizer, int(prompt_len), int(eos_id))
 
     # ------------------------------------------------------------------ 其它
     def collision_summary(self) -> dict[str, Any]:

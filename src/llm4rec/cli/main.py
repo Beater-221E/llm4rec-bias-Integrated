@@ -1,12 +1,12 @@
 """llm4rec-bias-Integrated 统一 CLI。
 
-    python -m llm4rec.cli.main validate       --config minionerec
-    python -m llm4rec.cli.main download-data  --config minionerec
-    python -m llm4rec.cli.main prepare-data   --config minionerec
-    python -m llm4rec.cli.main embed-items   --config minionerec
-    python -m llm4rec.cli.main build-sid     --config minionerec
-    python -m llm4rec.cli.main build-bm25    --config recr1
-    python -m llm4rec.cli.main run           --config minionerec --stages sft,eval,rl,eval
+    python -m llm4rec.cli.main validate       --config minionerec_qwen05b_amazon
+    python -m llm4rec.cli.main download-data  --config minionerec_qwen05b_amazon
+    python -m llm4rec.cli.main prepare-data   --config minionerec_qwen05b_amazon
+    python -m llm4rec.cli.main embed-items   --config minionerec_qwen05b_amazon
+    python -m llm4rec.cli.main build-sid     --config minionerec_qwen05b_amazon
+    python -m llm4rec.cli.main build-bm25    --config recr1_qwen05b_amazon
+    python -m llm4rec.cli.main run           --config minionerec_qwen05b_amazon --stages sft,eval,rl,eval
 
 一般不用直接敲这些 —— ``bash prepare.sh`` 和 ``bash run.sh`` 已经包好了。
 任意 ``a.b.c=value`` 可以跟在后面覆盖配置。
@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,35 @@ def _is_main_process() -> bool:
     return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))) == 0
 
 
+def _shared_run_stamp(parent: Path) -> str:
+    """Same timestamp on every rank.
+
+    ``datetime.now()`` per process can roll over a second boundary
+    (this job created both ``..._101526`` and ``..._101527``). Online
+    eval then waits forever for ``.done`` files in the other directory.
+    """
+    env = str(os.environ.get("LLM4REC_RUN_TS") or "").strip()
+    if env:
+        return env
+    port = str(os.environ.get("MASTER_PORT") or "single")
+    marker = parent / f".run_stamp_{port}"
+    if _is_main_process():
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(stamp + "\n", encoding="utf-8")
+        return stamp
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        if marker.is_file():
+            text = marker.read_text(encoding="utf-8").strip()
+            if text:
+                return text
+        time.sleep(0.05)
+    raise ConfigurationError(
+        f"rank {os.environ.get('RANK', '?')} timed out waiting for shared run stamp {marker}"
+    )
+
+
 def _build_run_dir(cfg: dict[str, Any]) -> Path:
     exp, data = cfg["experiment"], cfg["data"]
     from llm4rec.data.base import get_adapter
@@ -70,14 +100,14 @@ def _build_run_dir(cfg: dict[str, Any]) -> Path:
     root = Path(cfg["paths"].get("runs_dir") or "runs")
     if not root.is_absolute():
         root = project_root() / root
-    path = (
+    parent = (
         root
         / get_adapter(cfg).dataset_key(cfg)
         / str(exp["route"])
         / str(cfg["model"]["name"]).replace("/", "_")
         / f"seed_{cfg['seed']}"
-        / datetime.now().strftime("%Y%m%d_%H%M%S")
     )
+    path = parent / _shared_run_stamp(parent)
     path.mkdir(parents=True, exist_ok=True)
     return path
 

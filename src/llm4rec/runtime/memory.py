@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 from typing import Any, Callable
 
 import torch
@@ -9,6 +10,17 @@ import torch.distributed as dist
 
 from llm4rec.core import distributed as dist_utils
 from llm4rec.runtime.batch import probe_max_micro_batch, resolve_batch_plan
+
+
+def release_cuda_after_oom(exc: BaseException | None = None) -> None:
+    """Drop OOM traceback locals (they pin activation tensors) and free the cache."""
+    if exc is not None:
+        exc.__traceback__ = None
+        exc.__context__ = None
+        exc.__cause__ = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _broadcast_int(value: int, *, src: int = 0) -> int:
@@ -35,8 +47,8 @@ def auto_tune_micro_batch(
     """Return ``(per_device_batch_size, gradient_accumulation_steps)``.
 
     Probe runs on rank0 only (CUDA OOM probe is expensive / can desync ranks),
-    then the chosen micro-batch is broadcast so HF Trainer DDP sees identical
-    ``per_device_batch_size`` / ``gradient_accumulation_steps`` everywhere.
+    then the chosen micro-batch is broadcast so every rank uses the same
+    ``per_device_batch_size`` / ``gradient_accumulation_steps``.
     """
     micro = int(preferred)
     if memory_auto and probe_fn is not None:

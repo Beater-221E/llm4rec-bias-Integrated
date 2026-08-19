@@ -9,26 +9,16 @@
 from __future__ import annotations
 
 import logging
-import sys
-from typing import Any, Sequence, TextIO
+from typing import Any, Sequence
 
 import torch
 
 from llm4rec.decoders.base import Decoder
 from llm4rec.eval.bias import RankedResult
 from llm4rec.sid.table import SidTable
+from llm4rec.tracking.progress import overwrite_progress
 
 _LOG = logging.getLogger(__name__)
-
-
-def _tty_progress_file() -> TextIO | None:
-    """Prefer /dev/tty so a refreshing bar is visible under ``run.sh | tee``."""
-    try:
-        return open("/dev/tty", "w", encoding="utf-8", errors="replace")
-    except OSError:
-        if sys.stderr.isatty():
-            return sys.stderr
-        return None
 
 
 class ConstrainedBeamDecoder(Decoder):
@@ -58,6 +48,9 @@ class ConstrainedBeamDecoder(Decoder):
         examples: Sequence[dict[str, Any]],
         *,
         top_k: int,
+        progress_total: int | None = None,
+        progress_dir: Any = None,
+        progress_name: str | None = None,
     ) -> list[RankedResult]:
         from llm4rec.core import distributed as dist_utils
 
@@ -67,42 +60,35 @@ class ConstrainedBeamDecoder(Decoder):
 
         results: list[RankedResult] = []
         n_total = len(examples)
-        # One refreshing bar on rank0 only (avoids 4× duplicate INFO lines).
-        progress = None
-        tty: TextIO | None = None
-        if dist_utils.is_main() and n_total > 0:
-            try:
-                from tqdm import tqdm
-            except ImportError:
-                tqdm = None  # type: ignore[assignment]
-            if tqdm is not None:
-                tty = _tty_progress_file()
-                if tty is not None:
-                    progress = tqdm(
-                        total=n_total,
-                        desc="eval/constrained_beam",
-                        file=tty,
-                        dynamic_ncols=True,
-                        mininterval=0.5,
-                        leave=True,
-                    )
-
         ambiguity_before = int(getattr(self.table, "_ambiguity_count", 0) or 0)
-        try:
+        from transformers import LogitsProcessorList
+
+        from llm4rec.sid.constraint import SidPrefixLogitsProcessor
+
+        constraint = SidPrefixLogitsProcessor(self.table, tokenizer, 0, eos_id)
+        with overwrite_progress(
+            n_total,
+            "eval",
+            global_total=progress_total,
+            progress_dir=progress_dir,
+            name=progress_name or "eval/constrained_beam",
+        ) as progress:
             for example in examples:
                 input_ids = _encode_prompt(tokenizer, example["prompt"]).to(device)
                 prompt_len = input_ids.shape[1]
 
+                from llm4rec.sid.constraint import reset_generate_limits
+
+                reset_generate_limits(model, prompt_len, self.max_new_tokens, eos_id)
                 output = model.generate(
                     input_ids,
                     max_new_tokens=self.max_new_tokens,
                     num_beams=beams,
                     num_return_sequences=beams,
-                    prefix_allowed_tokens_fn=self.table.prefix_allowed_fn(
-                        tokenizer, prompt_len, eos_id
-                    ),
                     do_sample=False,
                     early_stopping=True,
+                    logits_processor=LogitsProcessorList([constraint.bind(prompt_len)]),
+                    eos_token_id=eos_id,
                     pad_token_id=eos_id,
                 )
 
@@ -139,16 +125,7 @@ class ConstrainedBeamDecoder(Decoder):
                         valid=n_invalid == 0 and bool(ranked),
                     )
                 )
-                if progress is not None:
-                    progress.update(1)
-        finally:
-            if progress is not None:
-                progress.close()
-            if tty is not None and tty is not sys.stderr:
-                try:
-                    tty.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                progress.update(1)
 
         ambiguity_delta = int(getattr(self.table, "_ambiguity_count", 0) or 0) - ambiguity_before
         if dist_utils.is_main() and ambiguity_delta > 0:
@@ -162,10 +139,24 @@ class ConstrainedBeamDecoder(Decoder):
 def _encode_prompt(tokenizer: Any, prompt: Any) -> torch.Tensor:
     """prompt 可以是 chat messages 列表，也可以是已经拼好的字符串。"""
     if isinstance(prompt, str):
-        return tokenizer(prompt, return_tensors="pt")["input_ids"]
-    encoded = tokenizer.apply_chat_template(
-        prompt, add_generation_prompt=True, return_tensors="pt"
-    )
-    if isinstance(encoded, torch.Tensor):
-        return encoded
-    return encoded["input_ids"]
+        text = prompt
+    else:
+        try:
+            text = tokenizer.apply_chat_template(
+                prompt, add_generation_prompt=True, tokenize=False
+            )
+        except Exception:
+            text = ""
+        if not str(text).strip():
+            text = "\n".join(
+                str(m.get("content") or "")
+                for m in prompt
+                if isinstance(m, dict)
+            )
+    encoded = tokenizer(text, return_tensors="pt", add_special_tokens=True)
+    ids = encoded["input_ids"] if not isinstance(encoded, torch.Tensor) else encoded
+    if ids.dim() == 1:
+        ids = ids.unsqueeze(0)
+    if ids.numel() == 0 or ids.shape[-1] == 0:
+        raise RuntimeError("eval prompt encoded to empty input_ids")
+    return ids

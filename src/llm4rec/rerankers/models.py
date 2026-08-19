@@ -195,9 +195,6 @@ def build_reranker(kind: str, n_items: int, cfg: dict[str, Any]) -> _BaseReranke
 
 
 def listwise_loss(scores: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """ListNet 风格的交叉熵：目标物品应当得分最高。
-
-    ``labels`` 是 one-hot（[B, L]，目标位置为 1）。
-    """
+    """ListNet 交叉熵。``labels`` 是 [B, L] 上已归一化的相关度分布。"""
     log_probs = F.log_softmax(scores, dim=-1)
     return -(labels * log_probs).sum(dim=-1).mean()

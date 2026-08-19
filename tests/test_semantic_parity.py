@@ -4,27 +4,36 @@ from __future__ import annotations
 
 import math
 
-import pytest
-import torch
-
 from llm4rec.data.minionerec_rl import (
     build_minionerec_reproduction_rl_eval,
     build_minionerec_reproduction_rl_train,
     rl_dataset_counts,
 )
-from llm4rec.data.minionerec_sft import (
+from llm4rec.data.minionerec_prompts import (
     ALPACA_FUSION_INSTRUCTION,
-    ALPACA_ITEMFEAT_INSTRUCTION,
     ALPACA_SFT_INSTRUCTION,
+    format_minionerec_alpaca_prompt,
+    format_minionerec_rl_prompt,
+    fusion_prompt,
+    sid2title_prompt,
+    sid_sft_prompt,
+    title2sid_prompt,
+)
+from llm4rec.data.minionerec_rl import (
+    rl_seq_title2sid_example,
+    sid_rl_example,
+)
+from llm4rec.data.minionerec_sft import (
     MiniOneRecReferenceSFTDataset,
     build_sft_rows,
     encode_reference,
-    fusion_prompt,
-    sid_sft_prompt,
-    sid2title_prompt,
-    title2sid_prompt,
+    fusion_seqrec_example,
+    sid_item_feat_examples,
+    sid_sft_example,
 )
+from llm4rec.trainers.rollouts import ConstrainedBeamRollout
 from llm4rec.trainers.rewards import (
+    make_minionerec_reward,
     make_minionerec_reference_reward,
     reference_ndcg_rule_reward,
     reference_rule_reward,
@@ -57,6 +66,8 @@ class FakeTokenizer:
 
 
 class FakeTable:
+    levels = 3
+
     def __contains__(self, item):
         return True
 
@@ -67,14 +78,65 @@ class FakeTable:
         return ["1", "2"]
 
 
-EXPECTED_SFT_PROMPT = (
-    "Below is an instruction that describes a task, paired with an input "
-    "that provides further context. Write a response that appropriately "
-    "completes the request. \n\n"
-    f"### Instruction:\n{ALPACA_SFT_INSTRUCTION}\n\n"
-    "### User Input: \nThe user has interacted with items <a_1><b_1><c_1> in "
-    "chronological order. Can you predict the next possible item that the user "
-    "may expect?\n\n"
+# Goldens match ``minionerec_prompts`` (MiniOneRec @ 0c64b955 templates).
+UPSTREAM_SID_SFT = (
+    "Below is an instruction that describes a task, paired with an input that "
+    "provides further context. Write a response that appropriately completes "
+    "the request.\n"
+    "### Instruction:\n"
+    "Can you predict the next possible item that the user may expect?\n"
+    "### User Input: \n"
+    "The user has interacted with items <a_1><b_2><c_3> in chronological order. "
+    "Can you predict the next possible item that the user may expect?\n"
+    "### Response:\n"
+)
+UPSTREAM_TITLE2SID = (
+    "Below is an instruction that describes a task, paired with an input that "
+    "provides further context. Write a response that appropriately completes "
+    "the request.\n"
+    "### Instruction:\n"
+    "Answer the question about item identification.\n"
+    "### User Input: \n"
+    "Which item has the title: Book?\n"
+    "### Response:\n"
+)
+UPSTREAM_SID2TITLE = (
+    "Below is an instruction that describes a task, paired with an input that "
+    "provides further context. Write a response that appropriately completes "
+    "the request.\n"
+    "### Instruction:\n"
+    "Answer the question about item identification.\n"
+    "### User Input: \n"
+    'What is the title of item "<a_1><b_2><c_3>"?\n'
+    "### Response:\n"
+)
+UPSTREAM_FUSION = (
+    "Below is an instruction that describes a task, paired with an input that "
+    "provides further context. Write a response that appropriately completes "
+    "the request.\n"
+    "### Instruction:\n"
+    "Can you recommend the next item for the user based on their interaction history?\n"
+    "### User Input: \n"
+    "The user has sequentially interacted with items <a_1><b_2><c_3>. "
+    "Can you recommend the next item for him? Tell me the title of the item\n"
+    "### Response:\n"
+)
+UPSTREAM_RL_SID = (
+    "### User Input: \n"
+    "The user has interacted with items <a_1><b_2><c_3> in chronological order. "
+    "Can you predict the next possible item that the user may expect?\n"
+    "### Response:\n"
+)
+UPSTREAM_RL_TITLE = "### User Input: \nWhich item has the title: Book?\n### Response:\n"
+UPSTREAM_RL_DESC = (
+    "### User Input: \n"
+    'An item can be described as follows: "A long story". Which item is it describing?\n'
+    "### Response:\n"
+)
+UPSTREAM_RL_SEQ = (
+    "### User Input: \n"
+    'Given the title sequence of user historical interactive items: "A", "B", '
+    "can you recommend a suitable next item for the user?\n"
     "### Response:\n"
 )
 
@@ -92,31 +154,41 @@ def test_minionerec_sft_does_not_use_chat_template():
 
 
 def test_minionerec_sid_sft_exact_prompt():
-    prompt = sid_sft_prompt(["<a_1><b_1><c_1>"])
-    assert prompt == EXPECTED_SFT_PROMPT
+    assert sid_sft_prompt(["<a_1><b_2><c_3>"]) == UPSTREAM_SID_SFT
 
 
 def test_minionerec_sid_item_feat_exact_prompt():
-    assert title2sid_prompt("T") == (
-        "Below is an instruction that describes a task, paired with an input "
-        "that provides further context. Write a response that appropriately "
-        "completes the request. \n\n"
-        f"### Instruction:\n{ALPACA_ITEMFEAT_INSTRUCTION}\n\n"
-        "### User Input: \nWhich item has the title: T?\n\n### Response:\n"
-    )
-    assert sid2title_prompt("SID") == (
-        "Below is an instruction that describes a task, paired with an input "
-        "that provides further context. Write a response that appropriately "
-        "completes the request. \n\n"
-        f"### Instruction:\n{ALPACA_ITEMFEAT_INSTRUCTION}\n\n"
-        '### User Input: \nWhat is the title of item "SID"?\n\n### Response:\n'
-    )
+    assert title2sid_prompt("Book") == UPSTREAM_TITLE2SID
+    assert sid2title_prompt("<a_1><b_2><c_3>") == UPSTREAM_SID2TITLE
 
 
 def test_minionerec_fusion_exact_prompt():
-    prompt = fusion_prompt(["<a_1><b_1><c_1>"])
-    assert ALPACA_FUSION_INSTRUCTION in prompt
-    assert "Tell me the title of the item" in prompt
+    assert fusion_prompt(["<a_1><b_2><c_3>"]) == UPSTREAM_FUSION
+    assert ALPACA_FUSION_INSTRUCTION in UPSTREAM_FUSION
+
+
+def test_minionerec_rl_prompt_exact():
+    ex = sid_rl_example(
+        history_sids=["<a_1><b_2><c_3>"], target_sid="<a_9><b_9><c_9>"
+    )
+    assert ex["prompt"] == UPSTREAM_RL_SID
+    assert format_minionerec_rl_prompt("Which item has the title: Book?") == UPSTREAM_RL_TITLE
+    assert (
+        format_minionerec_rl_prompt(
+            'An item can be described as follows: "A long story". Which item is it describing?'
+        )
+        == UPSTREAM_RL_DESC
+    )
+    seq = rl_seq_title2sid_example(
+        history_titles=["A", "B"], target_sid="<a_9><b_9><c_9>"
+    )
+    assert seq["prompt"] == UPSTREAM_RL_SEQ
+
+
+def test_minionerec_upstream_whitespace():
+    body = format_minionerec_alpaca_prompt(ALPACA_SFT_INSTRUCTION, "x")
+    assert "completes the request.\n### Instruction:" in body
+    assert format_minionerec_rl_prompt("hello") == "### User Input: \nhello\n### Response:\n"
 
 
 def test_minionerec_reference_token_ids():
@@ -205,6 +277,18 @@ def test_minionerec_rl_dataset_mixture():
         assert "reference_target_text" in ex
         assert isinstance(ex["prompt"], str)
         assert "### User Input:" in ex["prompt"]
+    a = [e["objective"] for e in out]
+    b = [
+        e["objective"]
+        for e in build_minionerec_reproduction_rl_train(
+            train_rows=rows,
+            sid_table=FakeTable(),
+            meta=meta,
+            datasets={"sid_seq": {"sample": -1}, "title_to_sid": {"sample": -1}, "seq_title_to_sid": {"sample": -1}},
+            seed=2,
+        )
+    ]
+    assert a != b
 
 
 def test_minionerec_rl_title2sid_prompt():
@@ -291,3 +375,58 @@ def test_minionerec_reproduction_no_invalid_minus_one_penalty():
     out = fn(rollout)
     assert -1.0 not in out
     assert out[1] >= 1.0  # rule hit
+
+
+def test_official_rule_reward_matches_sid_without_eos():
+    assert reference_rule_reward(["<a_1><b_2><c_3>"], ["<a_1><b_2><c_3>\n"]) == [1.0]
+
+
+def test_official_rule_reward_misses_if_im_end_kept():
+    assert reference_rule_reward(
+        ["<a_1><b_2><c_3><|im_end|>"], ["<a_1><b_2><c_3>\n"]
+    ) == [0.0]
+
+
+def test_minionerec_reward_defaults_to_official_ranking():
+    rollout = type(
+        "R",
+        (),
+        {
+            "texts": ["<a_1>", "miss"],
+            "example": {"reference_target_text": "<a_1>\n"},
+        },
+    )()
+    fn = make_minionerec_reward(None, {"reward": {"type": "ranking"}})
+    out = fn(rollout)
+    assert out[0] >= 1.0
+    assert -1.0 not in out
+
+
+def test_minionerec_reproduction_sft_objectives():
+    table = FakeTable()
+    meta = {"1": {"title": "Book A"}, "2": {"title": "Book B"}}
+    rows = [{"user_id": "u1", "history": ["1"], "target_item": "2"}]
+    exs = build_sft_rows(
+        train_rows=rows,
+        meta=meta,
+        sid_table=table,
+        objectives=["sid_sft", "sid_item_feat", "fusion_seqrec"],
+    )
+    tasks = {e["objective"] for e in exs}
+    assert {"sid_sft", "fusion_seqrec", "sid_item_feat"} <= tasks
+    sid = sid_sft_example(user_id="u", history=["1"], target="2", sid_table=table)
+    assert "chronological order" in sid["prompt"][0]["content"]
+    assert sid["answer"].startswith("<a_")
+    fusion = fusion_seqrec_example(
+        user_id="u", history=["1"], target="2", sid_table=table, meta=meta
+    )
+    assert "Tell me the title" in fusion["prompt"][0]["content"]
+    assert "Book B" in fusion["answer"]
+    assert len(sid_item_feat_examples(item="1", sid_table=table, meta=meta)) == 2
+
+
+def test_constrained_rollout_defaults_do_sample_true():
+    r = ConstrainedBeamRollout(FakeTable())
+    assert r.do_sample is True
+    assert r.temperature == 1.0
+    assert ConstrainedBeamRollout(FakeTable(), do_sample=False).do_sample is False

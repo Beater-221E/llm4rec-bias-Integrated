@@ -29,6 +29,9 @@ class Decoder(ABC):
         examples: Sequence[dict[str, Any]],
         *,
         top_k: int,
+        progress_total: int | None = None,
+        progress_dir: Any = None,
+        progress_name: str | None = None,
     ) -> list[RankedResult]:
         """对一批样本产出 ranked list。
 

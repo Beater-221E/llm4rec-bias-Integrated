@@ -43,6 +43,7 @@ class RuntimeContext:
     compile_backend: str | None = None
     compile_mode: str | None = None
     compile_fallback_reason: str | None = None
+    has_reference_model: bool = False
     _compiled: dict[int, Any] = field(default_factory=dict, repr=False)
     _log: Any = field(default=print, repr=False)
 
@@ -119,9 +120,6 @@ class RuntimeContext:
             f"resolved={ctx.resolved_strategy} effective={ctx.effective_strategy} "
             f"world_size={hw.world_size} find_unused={find_unused}"
         )
-        if ctx.fallback_reason and hw.world_size > 0:
-            # Rank-0 style warning already logged in apply_strategy_fallback
-            pass
         return ctx
 
     def bind_model_params(
@@ -152,6 +150,7 @@ class RuntimeContext:
                 has_reference_model = True
             else:
                 has_reference_model = False
+        self.has_reference_model = bool(has_reference_model)
         # Re-resolve when strategy was auto and model size now known
         if str(self.requested_strategy).lower() in {"auto", "none", ""}:
             train_block = (self.cfg.get("train") or {}).get(
@@ -214,7 +213,17 @@ class RuntimeContext:
             effective = req
         else:
             pb = float(self.model_params_b or 0.0)
-            if self.world_size <= 1:
+            total = int(self.hardware.total_memory or 0)
+            # CPU ref + SID-expanded lm_head (T×153k) is host-bound for minutes.
+            # Keep 0.5B/1B refs on GPU; only park large refs when VRAM is tight.
+            if (
+                bool(getattr(self, "has_reference_model", False))
+                and total
+                and total <= 20 * (1024**3)
+                and pb >= 3.0
+            ):
+                effective = "cpu_offload"
+            elif self.world_size <= 1:
                 effective = "replicated"
             elif pb >= 7.0:
                 effective = "fsdp"

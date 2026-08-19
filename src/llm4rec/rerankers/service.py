@@ -17,6 +17,20 @@ import torch.nn as nn
 
 from llm4rec.core.exceptions import MissingArtifactError
 from llm4rec.rerankers.models import KnowledgeAdaptor, build_reranker, listwise_loss
+from llm4rec.tracking.progress import overwrite_progress
+
+
+def _ndcg_at_k(order: Sequence[int], relevant: set[int], k: int) -> float:
+    """Binary NDCG@k; one relevant item reduces to 1/log2(rank+2) if in top-k."""
+    if k <= 0 or not relevant:
+        return 0.0
+    dcg = 0.0
+    for rank, idx in enumerate(order[:k]):
+        if int(idx) in relevant:
+            dcg += 1.0 / math.log2(rank + 2)
+    n_rel = min(len(relevant), k)
+    idcg = sum(1.0 / math.log2(i + 2) for i in range(n_rel))
+    return float(dcg / idcg) if idcg else 0.0
 
 
 class ReasoningEncoder:
@@ -65,7 +79,10 @@ class RerankerService:
         self.item_ids = list(item_ids)
         self.index_of = {item: i for i, item in enumerate(self.item_ids)}
         self.pad_index = len(self.item_ids)
-        self.candidate_size = int(self.rr_cfg.get("candidate_size") or 20)
+        # KAR ``rerank_list_len=10`` / ``rerank_item_from_hist=4``
+        # (DPO4Rec §V-A-4 follows KAR settings for the reward-model recommender).
+        self.candidate_size = int(self.rr_cfg.get("candidate_size") or 10)
+        self.n_positives = int(self.rr_cfg.get("n_positives") or 4)
 
         merged = dict(self.rr_cfg)
         merged["knowledge_adaptor"] = self.ka_cfg
@@ -99,43 +116,106 @@ class RerankerService:
         return self.adaptor(self.encoder.encode(texts))
 
     # ---------------------------------------------------------- 候选列表构建
+    def _positives(self, example: dict[str, Any]) -> list[str]:
+        """KAR: up to ``n_positives`` subsequent interactions are relevant.
+
+        ``target_item`` is always kept first so bias eval still has a primary item.
+        """
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for raw in (example.get("positive_items") or [example["target_item"]]):
+            item = str(raw)
+            if item in seen:
+                continue
+            seen.add(item)
+            ordered.append(item)
+            if len(ordered) >= self.n_positives:
+                break
+        target = str(example["target_item"])
+        if target not in seen:
+            ordered = [target, *ordered][: self.n_positives]
+        elif ordered[0] != target:
+            ordered = [target, *[item for item in ordered if item != target]]
+        return ordered
+
     def build_candidates(
         self,
         example: dict[str, Any],
         popularity: dict[str, int],
         rng: random.Random,
-    ) -> tuple[list[str], int]:
-        """目标物品 + 按流行度采样的负例，打乱后返回 ``(候选列表, 目标位置)``。
+    ) -> tuple[list[str], int, list[int]]:
+        """KAR/DPO4Rec candidate list: positives + uniform unobserved negatives.
 
-        ★ 负例按流行度采样（不是均匀）：这是 re-ranking 的标准做法，也是
-          bias 研究里必须固定的一个混杂因素 —— 候选集本身的流行度分布会
-          直接影响 pop_lift 的读数。
+        Paper §V-A-3: rerank top-K drawn from items the user has not interacted
+        with. KAR ``generate_rerank_data`` uses ``random.sample`` (uniform) to
+        fill ``rerank_list_len`` after taking the next ``rerank_item_from_hist``
+        interactions as positives. ``popularity`` is unused; kept for call-site
+        compatibility.
         """
-        target = str(example["target_item"])
-        history = set(map(str, example.get("history") or []))
-        pool = [i for i in self.item_ids if i != target and i not in history]
-        weights = [float(popularity.get(i, 0)) + 1.0 for i in pool]
+        del popularity
+        positives = self._positives(example)
+        history = {str(item) for item in (example.get("history") or [])}
+        exclude = history | set(positives)
+        n_neg = max(0, self.candidate_size - len(positives))
 
-        n_neg = self.candidate_size - 1
         negatives: list[str] = []
-        seen: set[str] = set()
-        # 按权重放回抽样，去重后补齐
-        for _ in range(n_neg * 4):
-            if len(negatives) >= n_neg:
+        seen = set(exclude)
+        n_items = len(self.item_ids)
+        max_tries = max(n_neg * 16, 64)
+        for _ in range(max_tries):
+            if len(negatives) >= n_neg or n_items == 0:
                 break
-            pick = rng.choices(pool, weights=weights, k=1)[0]
-            if pick not in seen:
-                seen.add(pick)
-                negatives.append(pick)
-        while len(negatives) < n_neg and pool:
-            pick = rng.choice(pool)
-            if pick not in seen:
-                seen.add(pick)
-                negatives.append(pick)
+            pick = self.item_ids[rng.randrange(n_items)]
+            if pick in seen:
+                continue
+            seen.add(pick)
+            negatives.append(pick)
+        if len(negatives) < n_neg:
+            for item in self.item_ids:
+                if len(negatives) >= n_neg:
+                    break
+                if item not in seen:
+                    seen.add(item)
+                    negatives.append(item)
 
-        candidates = [target, *negatives]
+        candidates = [*positives, *negatives]
         rng.shuffle(candidates)
-        return candidates, candidates.index(target)
+        pos_indices = [candidates.index(item) for item in positives]
+        return candidates, candidates.index(str(example["target_item"])), pos_indices
+
+    def assign_candidates(
+        self,
+        examples: Sequence[dict[str, Any]],
+        popularity: dict[str, int],
+        rng: random.Random,
+        *,
+        desc: str = "reranker/candidates",
+        logger: Any = None,
+    ) -> None:
+        """In-place attach ``_candidates`` / ``_target_pos`` / ``_pos_indices``.
+
+        Already-filled examples are skipped so ``train()`` can reuse the lists
+        built in ``build_context`` instead of sampling a second time.
+        """
+        if not examples:
+            return
+        total = len(examples)
+        _ = logger
+        with overwrite_progress(total, desc, log_interval_s=5.0) as bar:
+            for example in examples:
+                missing = (
+                    example.get("_candidates") is None
+                    or example.get("_target_pos") is None
+                    or example.get("_pos_indices") is None
+                )
+                if missing:
+                    candidates, pos, pos_indices = self.build_candidates(
+                        example, popularity, rng
+                    )
+                    example["_candidates"] = candidates
+                    example["_target_pos"] = pos
+                    example["_pos_indices"] = pos_indices
+                bar.update(1)
 
     def _to_tensor(self, candidates: Sequence[str]) -> torch.Tensor:
         idx = [self.index_of.get(str(c), self.pad_index) for c in candidates]
@@ -153,6 +233,7 @@ class RerankerService:
     ) -> dict[str, Any]:
         """训 reranker。第一轮没有推理文本（纯 ID baseline），
         后续 DPO 迭代里可以把当前最好的推理文本喂进来一起训。"""
+        self.ensure_device()
         epochs = int(self.rr_cfg.get("epochs") or 20)
         lr = float(self.rr_cfg.get("learning_rate") or 1e-3)
         batch_size = int(self.rr_cfg.get("batch_size") or 256)
@@ -165,9 +246,12 @@ class RerankerService:
         optimizer = torch.optim.Adam(params, lr=lr)
 
         rng = random.Random(seed)
-        # 候选集固定住：跨 epoch 复用同一份，避免负例噪声淹没信号
+        # 候选集固定住：优先复用 build_context 已经采好的列表，避免再扫一遍全库
+        self.assign_candidates(
+            examples, popularity, rng, desc="reranker/candidates", logger=logger
+        )
         prepared = [
-            (ex, *self.build_candidates(ex, popularity, rng)) for ex in examples
+            (ex, ex["_candidates"], int(ex["_target_pos"])) for ex in examples
         ]
 
         self.model.train()
@@ -182,8 +266,10 @@ class RerankerService:
                     device=self.device,
                 )
                 labels = torch.zeros(cand.shape, device=self.device)
-                for row, (_, _, pos) in enumerate(chunk):
-                    labels[row, pos] = 1.0
+                for row, (ex, _, _) in enumerate(chunk):
+                    for pos in ex.get("_pos_indices") or [ex["_target_pos"]]:
+                        labels[row, int(pos)] = 1.0
+                labels = labels / labels.sum(dim=-1, keepdim=True).clamp(min=1e-6)
 
                 knowledge = None
                 if reasoning_by_user:
@@ -220,19 +306,22 @@ class RerankerService:
         self, example: dict[str, Any], reasoning: str, *, top_k: int = 5
     ) -> float:
         """论文 Algorithm 1 的 ``Rec.evaluate(response)``：
-        用这份推理文本重排候选列表，返回 NDCG@k。"""
+        用这份推理文本重排候选列表，返回 NDCG@k（§V-A-3）。"""
         candidates = example.get("_candidates")
         target_pos = example.get("_target_pos")
         if candidates is None or target_pos is None:
             raise MissingArtifactError(
                 "样本缺少 _candidates/_target_pos —— DPO 阶段前要先构建候选列表"
             )
+        relevant = {
+            int(p) for p in (example.get("_pos_indices") or [target_pos])
+        }
+        self.ensure_device()
         self.model.eval()
         knowledge = self._knowledge_vector([reasoning])
         scores = self.model(self._to_tensor(candidates), knowledge)[0]
         order = torch.argsort(scores, descending=True).tolist()
-        rank = order.index(int(target_pos))
-        return float(1.0 / math.log2(rank + 2)) if rank < top_k else 0.0
+        return _ndcg_at_k(order, relevant, top_k)
 
     @torch.no_grad()
     def rerank(
@@ -240,6 +329,7 @@ class RerankerService:
     ) -> list[str]:
         """返回重排后的 top-K item id（给 bias evaluator 用）。"""
         candidates = example["_candidates"]
+        self.ensure_device()
         self.model.eval()
         knowledge = self._knowledge_vector([reasoning]) if reasoning else None
         scores = self.model(self._to_tensor(candidates), knowledge)[0]
@@ -265,3 +355,27 @@ class RerankerService:
             self.ensure_encoder()
             assert self.adaptor is not None
             self.adaptor.load_state_dict(blob["adaptor"])
+
+    def release_cuda(self) -> None:
+        """Park the reranker on CPU so SFT can use the full GPU."""
+        self.model.to("cpu")
+        if self.encoder is not None:
+            self.encoder.model.to("cpu")
+            self.encoder.device = "cpu"
+        if self.adaptor is not None:
+            self.adaptor.to("cpu")
+        self.device = "cpu"
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def ensure_device(self, device: str | None = None) -> None:
+        target = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if not torch.cuda.is_available() and str(target).startswith("cuda"):
+            target = "cpu"
+        self.device = target
+        self.model.to(self.device)
+        if self.encoder is not None:
+            self.encoder.model.to(self.device)
+            self.encoder.device = self.device
+        if self.adaptor is not None:
+            self.adaptor.to(self.device)

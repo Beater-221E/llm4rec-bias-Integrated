@@ -40,9 +40,7 @@ hardware:
   deepspeed: null
   # NCCL：默认不禁用 P2P/IB，让拓扑自检。排查问题时：
   #   export LLM4REC_NCCL_COMPAT=1
-  env:
-    TOKENIZERS_PARALLELISM: "false"
-    TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+  # TOKENIZERS_PARALLELISM / TORCH_NCCL_* 由 run.sh 设置，不在这里读。
 
 profiling:
   enabled: false
@@ -61,12 +59,6 @@ optimization:
   generation:
     cache: auto
     pad_to_multiple_of: 8
-  bucketing:
-    # experimental / inactive: LengthBucketBatchSampler exists but is not wired.
-    # Prefer HF Trainer group_by_length for SFT when desired.
-    enabled: false
-    status: experimental_inactive
-    buckets: [128, 256, 384, 512, 1024]
   triton:
     rq_distance_argmin: false
 
@@ -83,13 +75,10 @@ wandb:
   mode: online                 # online | offline | disabled
   # 每隔多少 optimizer step 推一次标量
   log_interval: 1
-  # 训练结束后把 run_dir 下的 metrics json 作为 artifact 上传
-  log_artifacts: false
 
 tracking:
   console: true
   jsonl: true                  # run_dir/metrics.jsonl，wandb 挂了也不丢数据
-  tensorboard: false
 
 # —— 评测（三条路线共用，全部在 ranked item list 上算）——
 evaluation:
@@ -105,4 +94,3 @@ checkpoint:
   save_stage_final: true       # 每个 stage 结束存一份（SFT 完 / RL 完）
   save_steps: 500              # 每隔 N 个 optimizer step 存一次；也可用 (0,1) 比例
   save_total_limit: 3          # 最多保留几个中间 checkpoint（不含 final）
-  save_optimizer_state: false  # 全参 0.5B 的 optimizer state 也有 ~2GB，默认不存

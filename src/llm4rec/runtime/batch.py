@@ -155,13 +155,9 @@ def probe_max_micro_batch(
             if "out of memory" not in str(exc).lower():
                 raise
             log(f"[memory-auto] OOM at per_device_batch_size={size}; retrying smaller")
-            try:
-                import torch
+            from llm4rec.runtime.memory import release_cuda_after_oom
 
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:  # noqa: BLE001
-                pass
+            release_cuda_after_oom(exc)
             if size == min_batch:
                 raise
             size = max(min_batch, size // 2)
