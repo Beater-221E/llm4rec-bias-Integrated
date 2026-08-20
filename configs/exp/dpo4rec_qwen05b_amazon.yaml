@@ -86,6 +86,8 @@ train:
     bias_eval_steps: 25
     eval_examples: 256
     logging_steps: 1
+    # 一次 generate 打包的 prompt 数（吞吐；7B 上默认 4，可调小防 OOM）
+    generate_batch_size: 4
 
     # —— 论文超参 ——
     beta: 0.01                  # 论文明确写 default 0.01

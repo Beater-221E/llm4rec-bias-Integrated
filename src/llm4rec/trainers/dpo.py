@@ -77,6 +77,131 @@ def sample_reasonings(
     return ids[0], completions, texts
 
 
+@torch.no_grad()
+def sample_reasonings_many(
+    model: Any,
+    tokenizer: Any,
+    examples: Sequence[dict[str, Any]],
+    *,
+    n: int,
+    temperature: float,
+    max_new_tokens: int,
+    use_cache: bool = True,
+    max_batch: int | None = None,
+) -> list[tuple[torch.Tensor, list[torch.Tensor], list[str]]]:
+    """Batched ``sample_reasonings``: several prompts in one padded generate.
+
+    7B 上逐样本串行 generate 只有 ~0.9 ex/s（DPO 采样瓶颈）。这里把一批
+    prompt 右对齐打成一个 batch 一次 ``model.generate``（num_return_sequences
+    不变），OOM 时自动二分回退，最终与单样本版语义一致。
+    """
+    if not examples:
+        return []
+    if len(examples) == 1 or max_batch == 1:
+        return [
+            sample_reasonings(
+                model,
+                tokenizer,
+                ex,
+                n=n,
+                temperature=temperature,
+                max_new_tokens=max_new_tokens,
+                use_cache=use_cache,
+            )
+            for ex in examples
+        ]
+    limit = int(max_batch) if max_batch and max_batch > 0 else len(examples)
+    if len(examples) > limit:
+        out: list[tuple[torch.Tensor, list[torch.Tensor], list[str]]] = []
+        for start in range(0, len(examples), limit):
+            out.extend(
+                sample_reasonings_many(
+                    model,
+                    tokenizer,
+                    examples[start : start + limit],
+                    n=n,
+                    temperature=temperature,
+                    max_new_tokens=max_new_tokens,
+                    use_cache=use_cache,
+                    max_batch=limit,
+                )
+            )
+        return out
+
+    device = next(model.parameters()).device
+    prompt_list: list[torch.Tensor] = []
+    for ex in examples:
+        encoded = tokenizer.apply_chat_template(
+            ex["prompt"], add_generation_prompt=True, return_tensors="pt"
+        )
+        ids = encoded if isinstance(encoded, torch.Tensor) else encoded["input_ids"]
+        prompt_list.append(ids[0].to(device))
+    prompt_lens = [int(p.numel()) for p in prompt_list]
+    max_len = max(prompt_lens)
+    pad = tokenizer.pad_token_id or tokenizer.eos_token_id
+    batch = len(prompt_list)
+    input_ids = torch.full(
+        (batch, max_len), int(pad), dtype=prompt_list[0].dtype, device=device
+    )
+    attention_mask = torch.zeros((batch, max_len), dtype=torch.long, device=device)
+    for i, (prompt, plen) in enumerate(zip(prompt_list, prompt_lens, strict=True)):
+        input_ids[i, -plen:] = prompt
+        attention_mask[i, -plen:] = 1
+
+    gen_kwargs: dict[str, Any] = {
+        "max_new_tokens": int(max_new_tokens),
+        "num_return_sequences": int(n),
+        "do_sample": True,
+        "temperature": float(temperature),
+        "top_p": 0.95,
+        "pad_token_id": int(pad),
+        "use_cache": bool(use_cache),
+    }
+    try:
+        output = model.generate(input_ids, attention_mask=attention_mask, **gen_kwargs)
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+        if "out of memory" not in str(exc).lower():
+            raise
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if len(examples) <= 1:
+            raise
+        mid = max(1, len(examples) // 2)
+        return sample_reasonings_many(
+            model,
+            tokenizer,
+            examples[:mid],
+            n=n,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+            use_cache=use_cache,
+            max_batch=mid,
+        ) + sample_reasonings_many(
+            model,
+            tokenizer,
+            examples[mid:],
+            n=n,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+            use_cache=use_cache,
+            max_batch=mid,
+        )
+
+    results: list[tuple[torch.Tensor, list[torch.Tensor], list[str]]] = []
+    for i, ex in enumerate(examples):
+        seqs = output[i * n : (i + 1) * n]
+        completions, texts = [], []
+        for sequence in seqs:
+            comp = sequence[prompt_lens[i] :]
+            if pad is not None:
+                nonpad = (comp != pad).nonzero()
+                comp = comp[: int(nonpad[-1]) + 1] if nonpad.numel() else comp[:0]
+            completions.append(comp)
+            texts.append(tokenizer.decode(comp, skip_special_tokens=True))
+        results.append((prompt_list[i], completions, texts))
+    return results
+
+
 def _pad_to_multiple(cfg: dict[str, Any]) -> int | None:
     opt = cfg.get("optimization") or {}
     gen = opt.get("generation") or {}
@@ -331,32 +456,38 @@ def run_dpo(
             name=f"dpo_sample_{iteration}",
             log_interval_s=5.0,
         ) as progress:
-            for example in local_examples:
-                prompt_ids, completions, texts = sample_reasonings(
+            gen_batch = int(dpo_cfg.get("generate_batch_size") or 4)
+            for start in range(0, len(local_examples), gen_batch):
+                chunk = local_examples[start : start + gen_batch]
+                sampled = sample_reasonings_many(
                     base_model,
                     tokenizer,
-                    example,
+                    chunk,
                     n=n_samples,
                     temperature=temperature,
                     max_new_tokens=max_new_tokens,
                     use_cache=use_cache,
+                    max_batch=gen_batch,
                 )
-                scores = score_fn(example, texts)
-                if len(set(scores)) < 2:
+                for example, (prompt_ids, completions, texts) in zip(
+                    chunk, sampled, strict=True
+                ):
+                    scores = score_fn(example, texts)
+                    if len(set(scores)) < 2:
+                        progress.update(1)
+                        continue
+                    best = max(range(len(scores)), key=lambda i: scores[i])
+                    worst = min(range(len(scores)), key=lambda i: scores[i])
+                    pairs.append(
+                        {
+                            "prompt_ids": prompt_ids,
+                            "chosen": completions[best],
+                            "rejected": completions[worst],
+                            "score_gap": scores[best] - scores[worst],
+                        }
+                    )
+                    best_reasoning[str(example.get("user_id") or "")] = texts[best]
                     progress.update(1)
-                    continue
-                best = max(range(len(scores)), key=lambda i: scores[i])
-                worst = min(range(len(scores)), key=lambda i: scores[i])
-                pairs.append(
-                    {
-                        "prompt_ids": prompt_ids,
-                        "chosen": completions[best],
-                        "rejected": completions[worst],
-                        "score_gap": scores[best] - scores[worst],
-                    }
-                )
-                best_reasoning[str(example.get("user_id") or "")] = texts[best]
-                progress.update(1)
 
         pairs, best_reasoning, stop = _align_iteration_state(
             pairs, best_reasoning, logger
@@ -530,6 +661,7 @@ def run_dpo(
 __all__ = [
     "dpo_loss",
     "sample_reasonings",
+    "sample_reasonings_many",
     "score_preference_batch",
     "run_dpo",
     "sequence_logprobs",

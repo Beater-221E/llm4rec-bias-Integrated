@@ -307,21 +307,40 @@ class RerankerService:
     ) -> float:
         """论文 Algorithm 1 的 ``Rec.evaluate(response)``：
         用这份推理文本重排候选列表，返回 NDCG@k（§V-A-3）。"""
+        return self.score_reasonings(example, [reasoning], top_k=top_k)[0]
+
+    @torch.no_grad()
+    def score_reasonings(
+        self,
+        example: dict[str, Any],
+        reasoning_texts: Sequence[str],
+        *,
+        top_k: int = 5,
+    ) -> list[float]:
+        """Batched ``score_reasoning`` —— 一次 encoder + 一次 reranker forward。
+
+        N 条推理文本共享同一个候选列表，把候选张量 expand 成 [N, L] 一起
+        forward，避免 DPO 采样时逐文本串行打分。
+        """
         candidates = example.get("_candidates")
         target_pos = example.get("_target_pos")
         if candidates is None or target_pos is None:
             raise MissingArtifactError(
                 "样本缺少 _candidates/_target_pos —— DPO 阶段前要先构建候选列表"
             )
+        if not reasoning_texts:
+            return []
         relevant = {
             int(p) for p in (example.get("_pos_indices") or [target_pos])
         }
         self.ensure_device()
         self.model.eval()
-        knowledge = self._knowledge_vector([reasoning])
-        scores = self.model(self._to_tensor(candidates), knowledge)[0]
-        order = torch.argsort(scores, descending=True).tolist()
-        return _ndcg_at_k(order, relevant, top_k)
+        knowledge = self._knowledge_vector(reasoning_texts)  # [N, D]
+        cand = self._to_tensor(candidates)                    # [1, L]
+        cand_batch = cand.expand(len(reasoning_texts), -1)   # [N, L]
+        scores = self.model(cand_batch, knowledge)            # [N, L]
+        orders = torch.argsort(scores, descending=True)
+        return [_ndcg_at_k(order.tolist(), relevant, top_k) for order in orders]
 
     @torch.no_grad()
     def rerank(

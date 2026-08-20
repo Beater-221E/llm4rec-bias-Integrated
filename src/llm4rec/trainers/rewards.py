@@ -227,9 +227,6 @@ def make_dpo4rec_scorer(reranker: Any, cfg: dict[str, Any]):
     top_k = int(reward_cfg.get("top_k") or 5)
 
     def score_fn(example: dict[str, Any], reasoning_texts: Sequence[str]) -> list[float]:
-        return [
-            reranker.score_reasoning(example, text, top_k=top_k)
-            for text in reasoning_texts
-        ]
+        return reranker.score_reasonings(example, reasoning_texts, top_k=top_k)
 
     return score_fn

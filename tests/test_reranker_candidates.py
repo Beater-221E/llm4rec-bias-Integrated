@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import random
+from typing import Any
 
 from llm4rec.rerankers.service import RerankerService, _ndcg_at_k
 from llm4rec.tracking.progress import overwrite_progress
@@ -119,3 +120,49 @@ def test_shared_progress_sums_all_ranks(tmp_path, monkeypatch):
         (tmp_path / "eval1.rank2").write_text("1", encoding="utf-8")
         (tmp_path / "eval1.rank3").write_text("3", encoding="utf-8")
         assert bar.global_done() == 7
+
+
+def _example_with_candidates() -> dict[str, Any]:
+    return {
+        "target_item": "i0",
+        "history": ["i1", "i2"],
+        "positive_items": ["i0", "i3"],
+        "_candidates": ["i0", "i3", "i5", "i7", "i9", "i11", "i13", "i15", "i17", "i19"],
+        "_target_pos": 0,
+        "_pos_indices": [0, 1],
+    }
+
+
+def _text_seeded_knowledge(texts):
+    """Deterministic per-text vector so batch vs single agree."""
+    import torch
+
+    vecs = []
+    for t in texts:
+        rng = torch.Generator().manual_seed(abs(hash(t)) % (2**32))
+        vecs.append(torch.randn(64, generator=rng))
+    return torch.stack(vecs)
+
+
+def test_score_reasonings_batched_matches_single(monkeypatch):
+    service = _service()
+    monkeypatch.setattr(service, "_knowledge_vector", _text_seeded_knowledge)
+    example = _example_with_candidates()
+    texts = ["reasoning A", "reasoning B", "reasoning C"]
+    batched = service.score_reasonings(example, texts, top_k=5)
+    single = [service.score_reasoning(example, t, top_k=5) for t in texts]
+    assert batched == single
+    assert len(batched) == len(texts)
+    assert service.score_reasonings(example, [], top_k=5) == []
+
+
+def test_score_reasonings_missing_candidates_raises():
+    service = _service()
+    example = {"target_item": "i0"}
+    try:
+        service.score_reasonings(example, ["a"], top_k=5)
+        raise AssertionError("expected MissingArtifactError")
+    except Exception as exc:
+        from llm4rec.core.exceptions import MissingArtifactError
+
+        assert isinstance(exc, MissingArtifactError)
