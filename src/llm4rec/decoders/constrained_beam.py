@@ -86,7 +86,9 @@ class ConstrainedBeamDecoder(Decoder):
                     num_beams=beams,
                     num_return_sequences=beams,
                     do_sample=False,
-                    early_stopping=True,
+                    early_stopping=False,
+                    length_penalty=0.0,
+                    repetition_penalty=1.0,
                     logits_processor=LogitsProcessorList([constraint.bind(prompt_len)]),
                     eos_token_id=eos_id,
                     pad_token_id=eos_id,
@@ -137,24 +139,36 @@ class ConstrainedBeamDecoder(Decoder):
 
 
 def _encode_prompt(tokenizer: Any, prompt: Any) -> torch.Tensor:
-    """prompt 可以是 chat messages 列表，也可以是已经拼好的字符串。"""
+    """Match SFT: ``apply_chat_template(..., tokenize=True)`` when possible."""
     if isinstance(prompt, str):
-        text = prompt
+        encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
+        ids = encoded["input_ids"] if not isinstance(encoded, torch.Tensor) else encoded
     else:
+        ids = None
         try:
-            text = tokenizer.apply_chat_template(
-                prompt, add_generation_prompt=True, tokenize=False
+            encoded = tokenizer.apply_chat_template(
+                prompt, add_generation_prompt=True, tokenize=True, return_tensors="pt"
             )
+            ids = encoded["input_ids"] if hasattr(encoded, "input_ids") else encoded
+            if not isinstance(ids, torch.Tensor):
+                ids = torch.tensor(ids, dtype=torch.long)
         except Exception:
-            text = ""
-        if not str(text).strip():
-            text = "\n".join(
-                str(m.get("content") or "")
-                for m in prompt
-                if isinstance(m, dict)
-            )
-    encoded = tokenizer(text, return_tensors="pt", add_special_tokens=True)
-    ids = encoded["input_ids"] if not isinstance(encoded, torch.Tensor) else encoded
+            ids = None
+        if ids is None or (isinstance(ids, torch.Tensor) and ids.numel() == 0):
+            try:
+                text = tokenizer.apply_chat_template(
+                    prompt, add_generation_prompt=True, tokenize=False
+                )
+            except Exception:
+                text = ""
+            if not str(text).strip():
+                text = "\n".join(
+                    str(m.get("content") or "")
+                    for m in prompt
+                    if isinstance(m, dict)
+                )
+            encoded = tokenizer(text, return_tensors="pt", add_special_tokens=True)
+            ids = encoded["input_ids"] if not isinstance(encoded, torch.Tensor) else encoded
     if ids.dim() == 1:
         ids = ids.unsqueeze(0)
     if ids.numel() == 0 or ids.shape[-1] == 0:

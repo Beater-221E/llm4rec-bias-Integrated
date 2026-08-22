@@ -59,6 +59,11 @@ def reset_generate_limits(model: Any, prompt_len: int, max_new_tokens: int, eos_
     eval loop calls generate once per example). A leftover small ``max_length``
     from warmup can also clip decode. Clearing it lets HF compute
     ``max_length = max_new_tokens + prompt_len`` internally.
+
+    Also neutralize Qwen2.5-Instruct ``generation_config`` chat defaults
+    (``repetition_penalty=1.1``, ``top_k=20``, ``do_sample=True``). Those merge
+    into ``model.generate()`` and penalize SID tokens already present in the
+    user history, which collapses constrained beam to a few global items.
     """
     del prompt_len
     gc = getattr(model, "generation_config", None)
@@ -72,6 +77,20 @@ def reset_generate_limits(model: Any, prompt_len: int, max_new_tokens: int, eos_
             gc.__dict__["max_length"] = None
     gc.eos_token_id = int(eos_id)
     gc.pad_token_id = int(eos_id)
+    gc.do_sample = False
+    for key, value in (
+        ("repetition_penalty", 1.0),
+        ("no_repeat_ngram_size", 0),
+        ("temperature", 1.0),
+        ("top_p", 1.0),
+        ("top_k", 0),
+        ("typical_p", 1.0),
+    ):
+        if hasattr(gc, key):
+            try:
+                setattr(gc, key, value)
+            except (TypeError, ValueError):
+                pass
 
 
 def constraint_generate_kwargs(

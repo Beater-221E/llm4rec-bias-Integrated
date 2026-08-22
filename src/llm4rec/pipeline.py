@@ -472,10 +472,16 @@ class Pipeline:
             )
             out = self.run_dir / "eval"
             out.mkdir(parents=True, exist_ok=True)
-            (out / f"{tag}.json").write_text(
-                json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n",
-                encoding="utf-8",
-            )
+            text = json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n"
+            (out / f"{tag}.json").write_text(text, encoding="utf-8")
+            resume = self.cfg.get("resume_from")
+            if resume:
+                ckpt = Path(str(resume))
+                # eval 单独起 run 时，把指标也挂到 checkpoint 所在 run，方便 notebook 查找
+                host = ckpt.parent.parent / "eval"
+                if host.parent.is_dir():
+                    host.mkdir(parents=True, exist_ok=True)
+                    (host / f"{tag}.json").write_text(text, encoding="utf-8")
             self.logger.print_metrics_list(metrics, title=f"{tag} metrics")
         dist_utils.barrier(f"{tag}_done")
 

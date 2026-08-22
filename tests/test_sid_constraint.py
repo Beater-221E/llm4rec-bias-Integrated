@@ -114,8 +114,14 @@ def test_reset_generate_limits_clears_stale_max_length():
     class _GC:
         max_length = 9
         max_new_tokens = 1
-        eos_token_id = None
+        eos_token_id = [151645, 151643]
         pad_token_id = None
+        do_sample = True
+        repetition_penalty = 1.1
+        no_repeat_ngram_size = 3
+        temperature = 0.7
+        top_p = 0.8
+        top_k = 20
 
     class _M:
         generation_config = _GC()
@@ -125,6 +131,9 @@ def test_reset_generate_limits_clears_stale_max_length():
     # Must not keep a conflicting max_length (HF would warn on every generate).
     assert _M.generation_config.max_length is None
     assert _M.generation_config.eos_token_id == 2
+    assert _M.generation_config.do_sample is False
+    assert _M.generation_config.repetition_penalty == 1.0
+    assert _M.generation_config.top_k == 0
 
 
 def test_constraint_processor_bind_updates_prompt_len(tmp_path):
