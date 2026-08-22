@@ -27,9 +27,11 @@ from llm4rec.data.minionerec_sft import (
     MiniOneRecReferenceSFTDataset,
     build_sft_rows,
     encode_reference,
+    example_prompt_style,
     fusion_seqrec_example,
     sid_item_feat_examples,
     sid_sft_example,
+    uses_reference_sft,
 )
 from llm4rec.trainers.rollouts import ConstrainedBeamRollout
 from llm4rec.trainers.rewards import (
@@ -423,6 +425,67 @@ def test_minionerec_reproduction_sft_objectives():
     assert "Tell me the title" in fusion["prompt"][0]["content"]
     assert "Book B" in fusion["answer"]
     assert len(sid_item_feat_examples(item="1", sid_table=table, meta=meta)) == 2
+
+
+def test_uses_reference_sft_default_minionerec():
+    cfg = {"experiment": {"route": "minionerec"}}
+    assert uses_reference_sft(cfg) is True
+    assert example_prompt_style(cfg) == "minionerec_alpaca"
+    chat = {"experiment": {"route": "minionerec"}, "train": {"sft": {"recipe": "chat"}}}
+    assert uses_reference_sft(chat) is False
+    assert example_prompt_style(chat) == "chat_titles"
+    assert uses_reference_sft({"experiment": {"route": "recr1"}}) is False
+
+
+def test_sid_seqrec_alpaca_matches_official_prompt():
+    from llm4rec.data.examples import sid_seqrec_example
+
+    table = FakeTable()
+    ex = sid_seqrec_example(
+        user_id="u",
+        history=["1"],
+        target="2",
+        sid_table=table,
+        meta={"1": {"title": "Book A"}, "2": {"title": "Book B"}},
+        prompt_style="minionerec_alpaca",
+    )
+    assert isinstance(ex["prompt"], str)
+    assert ex["prompt"] == sid_sft_prompt(["<a_1><b_1><c_1>"])
+    assert ex["prompt_text"] == ex["prompt"]
+    assert ex["answer"] == "<a_2><b_2><c_2>\n"
+    assert "Book A" not in ex["prompt"]
+
+
+def test_sid_seqrec_chat_titles_keeps_titles():
+    from llm4rec.data.examples import sid_seqrec_example
+
+    ex = sid_seqrec_example(
+        user_id="u",
+        history=["1"],
+        target="2",
+        sid_table=FakeTable(),
+        meta={"1": {"title": "Book A"}, "2": {"title": "Book B"}},
+        prompt_style="chat_titles",
+    )
+    assert isinstance(ex["prompt"], list)
+    assert "Book A" in ex["prompt"][1]["content"]
+
+
+def test_encode_prompt_string_matches_reference_sft():
+    from llm4rec.decoders.constrained_beam import _encode_prompt
+
+    tok = FakeTokenizer()
+    text = sid_sft_prompt(["<a_1>"])
+    ids = _encode_prompt(tok, text)
+    assert ids.tolist() == [encode_reference(tok, text, bos=True, eos=False)]
+
+
+def test_distill_prompt_token_ids_string_uses_reference():
+    from llm4rec.data.minionerec_distill import _prompt_token_ids
+
+    tok = FakeTokenizer()
+    text = sid_sft_prompt(["<a_1>"])
+    assert _prompt_token_ids(tok, text) == encode_reference(tok, text, bos=True, eos=False)
 
 
 def test_constrained_rollout_defaults_do_sample_true():

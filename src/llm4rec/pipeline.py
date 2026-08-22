@@ -266,12 +266,12 @@ class Pipeline:
         sft_cfg = (self.cfg.get("train") or {}).get("sft") or {}
         mode = get_mode(self.cfg)
 
-        # MiniOneRec reproduction: SidSFT + SidItemFeat + FusionSeqRec (upstream).
-        if (
-            mode == "reproduction"
-            and self.route == "minionerec"
-            and ctx.sid_table is not None
-        ):
+        # MiniOneRec official mix: SidSFT + SidItemFeat + FusionSeqRec.
+        # ctx.train_examples stay seqrec windows so transition/distill keep
+        # history + target_item. Only the SFT trainer sees the concatenated mix.
+        from llm4rec.data.minionerec_sft import uses_reference_sft
+
+        if uses_reference_sft(self.cfg, route=self.route) and ctx.sid_table is not None:
             from llm4rec.data.minionerec_sft import build_sft_rows, sft_dataset_counts
 
             objectives = list(
@@ -296,7 +296,8 @@ class Pipeline:
             )
             counts = sft_dataset_counts(train)
             self.logger.info(
-                f"[sft] MiniOneRec reproduction objectives={objectives} counts={counts}"
+                f"[sft] MiniOneRec official mix mode={mode} "
+                f"objectives={objectives} counts={counts}"
             )
             ctx.summaries.setdefault("sft_dataset_counts", counts)
             eval_rows = [

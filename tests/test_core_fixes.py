@@ -321,6 +321,20 @@ def test_tokenizer_larger_than_embedding_still_errors():
         _assert_tokenizer_matches_model(Tok(), Model())
 
 
+def test_encode_prompt_rejects_empty_string_ids():
+    from llm4rec.decoders.constrained_beam import _encode_prompt
+
+    class EmptyTok:
+        bos_token_id = None
+        eos_token_id = None
+
+        def encode(self, text):
+            return []
+
+    with pytest.raises(RuntimeError, match="empty input_ids"):
+        _encode_prompt(EmptyTok(), "### Response:\n")
+
+
 def test_encode_prompt_rejects_empty_ids():
     from llm4rec.decoders.constrained_beam import _encode_prompt
 

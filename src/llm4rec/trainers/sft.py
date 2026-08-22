@@ -664,7 +664,11 @@ def run_sft(
     max_len = int(sft_cfg.get("max_seq_length") or 1024)
     mode = str(cfg.get("mode") or (cfg.get("experiment") or {}).get("mode") or "integrated")
     route = str((cfg.get("experiment") or {}).get("route") or "")
-    reference_sft = mode == "reproduction" and route == "minionerec"
+    reference_sft = bool(train_examples) and (
+        "prompt_text" in train_examples[0]
+        or str(sft_cfg.get("tokenization") or "") == "raw"
+        or (mode == "reproduction" and route == "minionerec")
+    )
     n_train_global = len(train_examples)
     n_eval_global = len(eval_examples or [])
 

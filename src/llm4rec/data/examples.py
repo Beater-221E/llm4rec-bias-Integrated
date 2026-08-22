@@ -19,6 +19,8 @@ import json
 from typing import Any, Sequence
 
 from llm4rec.core.exceptions import ConfigurationError
+from llm4rec.data.minionerec_prompts import sid_sft_prompt
+from llm4rec.data.minionerec_sft import example_prompt_style
 
 # ---------------------------------------------------------------- 通用 prompt
 
@@ -60,16 +62,41 @@ def sid_seqrec_example(
     meta: dict[str, dict[str, Any]],
     with_titles: bool = True,
     category_prompt: str = "items",
+    prompt_style: str = "chat_titles",
 ) -> dict[str, Any] | None:
-    """序列推荐主任务：历史 SID（+标题）→ 目标 SID。"""
+    """序列推荐主任务：历史 SID（+标题）→ 目标 SID。
+
+    ``prompt_style=minionerec_alpaca`` 与官方 SidSFT 一致：SID-only 历史、
+    Alpaca 字符串、answer 带换行。评测 / 蒸馏必须走同一格式。
+    """
     hist = [i for i in history if i in sid_table]
     if not hist or target not in sid_table:
         return None
 
+    target_sid = str(sid_table.sid(target))
+    style = str(prompt_style or "chat_titles")
+    if style in ("minionerec_alpaca", "alpaca"):
+        sids = [str(sid_table.sid(item)) for item in hist]
+        text = sid_sft_prompt(sids)
+        answer = target_sid + "\n"
+        return {
+            "task": "seqrec",
+            "objective": "sid_sft",
+            "user_id": str(user_id),
+            "history": [str(i) for i in hist],
+            "target_item": str(target),
+            "target_sid": target_sid,
+            "prompt": text,
+            "prompt_text": text,
+            "answer": answer,
+            "answer_text": answer,
+        }
+
+    use_titles = with_titles and style != "chat_sid"
     lines = []
     for idx, item in enumerate(hist, 1):
         sid = sid_table.sid(item)
-        if with_titles:
+        if use_titles:
             title = str((meta.get(str(item)) or {}).get("title") or "")[:80]
             lines.append(f"{idx}. {sid} {title}")
         else:
@@ -85,11 +112,12 @@ def sid_seqrec_example(
         "user_id": str(user_id),
         "history": [str(i) for i in hist],
         "target_item": str(target),
+        "target_sid": target_sid,
         "prompt": [
             {"role": "system", "content": SYSTEM_SID},
             {"role": "user", "content": user_msg},
         ],
-        "answer": sid_table.sid(target),
+        "answer": target_sid,
     }
 
 
@@ -279,6 +307,7 @@ def build_examples(
     data = cfg["data"]
     history_max = int(data.get("history_max_length") or 20)
     category_prompt = str(data.get("category_prompt") or "items")
+    prompt_style = example_prompt_style(cfg) if route == "minionerec" else "chat_titles"
     out: list[dict[str, Any]] = []
 
     for user, events in sequences.items():
@@ -306,6 +335,7 @@ def build_examples(
                 meta=meta,
                 sid_table=sid_table,
                 category_prompt=category_prompt,
+                prompt_style=prompt_style,
             )
             if example is not None:
                 example["split"] = split
@@ -333,6 +363,7 @@ def _dispatch(
     meta: dict[str, dict[str, Any]],
     sid_table: Any,
     category_prompt: str,
+    prompt_style: str = "chat_titles",
 ) -> dict[str, Any] | None:
     if route == "minionerec":
         if sid_table is None:
@@ -344,6 +375,7 @@ def _dispatch(
             sid_table=sid_table,
             meta=meta,
             category_prompt=category_prompt,
+            prompt_style=prompt_style,
         )
     if route == "recr1":
         return query_gen_example(

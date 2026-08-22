@@ -139,10 +139,12 @@ class ConstrainedBeamDecoder(Decoder):
 
 
 def _encode_prompt(tokenizer: Any, prompt: Any) -> torch.Tensor:
-    """Match SFT: ``apply_chat_template(..., tokenize=True)`` when possible."""
+    """Match SFT: Alpaca strings use ``encode_reference``; chat uses the template."""
     if isinstance(prompt, str):
-        encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
-        ids = encoded["input_ids"] if not isinstance(encoded, torch.Tensor) else encoded
+        from llm4rec.data.minionerec_sft import encode_reference
+
+        tokens = encode_reference(tokenizer, prompt, bos=True, eos=False)
+        ids = torch.tensor([tokens], dtype=torch.long)
     else:
         ids = None
         try:

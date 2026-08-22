@@ -36,13 +36,44 @@ __all__ = [
     "MiniOneRecReferenceSFTDataset",
     "build_sft_rows",
     "encode_reference",
+    "example_prompt_style",
     "format_minionerec_alpaca_prompt",
     "fusion_prompt",
     "sid2title_prompt",
     "sid_sft_prompt",
     "sft_dataset_counts",
+    "sft_recipe",
     "title2sid_prompt",
+    "uses_reference_sft",
 ]
+
+
+def sft_recipe(cfg: dict[str, Any] | None = None) -> str:
+    """``train.sft.recipe``: ``minionerec_reference`` (default) or ``chat``."""
+    sft = ((cfg or {}).get("train") or {}).get("sft") or {}
+    return str(sft.get("recipe") or "minionerec_reference")
+
+
+def uses_reference_sft(cfg: dict[str, Any] | None = None, *, route: str = "") -> bool:
+    """Official SidSFT + SidItemFeat + FusionSeqRec, raw Alpaca tokenization."""
+    cfg = cfg or {}
+    route = route or str((cfg.get("experiment") or {}).get("route") or "")
+    if route != "minionerec":
+        return False
+    return sft_recipe(cfg) not in ("chat", "integrated_chat")
+
+
+def example_prompt_style(cfg: dict[str, Any] | None = None) -> str:
+    """Eval / distill / seqrec rows must use the same prompt family as SFT."""
+    cfg = cfg or {}
+    data = cfg.get("data") or {}
+    sft = (cfg.get("train") or {}).get("sft") or {}
+    explicit = data.get("prompt_style") or sft.get("prompt_style")
+    if explicit:
+        return str(explicit)
+    if uses_reference_sft(cfg):
+        return "minionerec_alpaca"
+    return "chat_titles"
 
 
 def encode_reference(

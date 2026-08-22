@@ -22,7 +22,11 @@ from llm4rec.sid.table import sid_token
 IGNORE_INDEX = -100
 
 
-def _prompt_token_ids(tokenizer: Any, prompt: Sequence[dict[str, Any]]) -> list[int]:
+def _prompt_token_ids(tokenizer: Any, prompt: Sequence[dict[str, Any]] | str) -> list[int]:
+    if isinstance(prompt, str):
+        from llm4rec.data.minionerec_sft import encode_reference
+
+        return encode_reference(tokenizer, prompt, bos=True, eos=False)
     ids = tokenizer.apply_chat_template(
         prompt, add_generation_prompt=True, tokenize=True
     )
