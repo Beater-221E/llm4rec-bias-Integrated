@@ -266,7 +266,10 @@ def run_sid_distill(
 
     from llm4rec.runtime.activation_ckpt import resolve_activation_checkpointing
     from llm4rec.runtime.checkpointing import (
+        is_better_metric,
         resolve_save_steps,
+        save_best_checkpoint,
+        save_best_enabled,
         save_step_checkpoint,
         should_save_at_step,
     )
@@ -288,7 +291,9 @@ def run_sid_distill(
         logger.info(f"[distill] gradient checkpointing on ({act_reason})")
 
     strategy = runtime.effective_strategy or runtime.strategy.strategy
-    train_core = runtime.maybe_compile(model, name="distill_policy")
+    if dist_utils.is_main():
+        logger.info("[distill] skip torch.compile（变长 batch + SID vocab，inductor 不稳定）")
+    train_core = model
     if strategy == "fsdp" and runtime.world_size > 1:
         train_model = runtime.wrap_model(train_core)
     else:
@@ -330,6 +335,7 @@ def run_sid_distill(
     step = 0
     last = {"loss": 0.0, "hard": 0.0, "soft": 0.0, "exposure": 0.0}
     last_eval = None
+    best_eval: float | None = None
     history: list[dict[str, Any]] = []
     t0 = time.perf_counter()
     samples_seen = 0
@@ -476,6 +482,22 @@ def run_sid_distill(
                         wandb_prefix="eval",
                     )
                     logger.info(f"[distill] eval step={step} hard_nll={last_eval:.4f}")
+                if (
+                    last_eval is not None
+                    and save_best_enabled(cfg)
+                    and is_better_metric(last_eval, best_eval)
+                ):
+                    best_eval = last_eval
+                    save_best_checkpoint(
+                        train_model,
+                        output_dir,
+                        metric=last_eval,
+                        step=step,
+                        tokenizer=tokenizer,
+                        logger=logger,
+                        tag="distill",
+                        metric_name="eval_hard_nll",
+                    )
 
             if should_save_at_step(step, save_every):
                 save_step_checkpoint(
@@ -512,6 +534,8 @@ def run_sid_distill(
     metrics = {"train_loss": last["loss"], "train_steps": step, **last}
     if last_eval is not None:
         metrics["eval_hard_nll"] = last_eval
+    if best_eval is not None:
+        metrics["best_eval_hard_nll"] = best_eval
     logger.info(f"[distill] 完成，权重 → {final_dir}")
     return {
         "stage": "distill",

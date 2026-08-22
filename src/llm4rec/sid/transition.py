@@ -675,6 +675,29 @@ def run_transition(
     history: list[dict[str, Any]] = []
     step = 0
     stop = False
+    config = {
+        "codebook_sizes": codebook_sizes,
+        "levels": levels,
+        "embedding_dim": int(tcfg.get("embedding_dim") or 128),
+        "hidden_dim": int(tcfg.get("hidden_dim") or 256),
+        "decay": float(tcfg.get("decay") or 0.9),
+        "dropout": float(tcfg.get("dropout") or 0.3),
+        "history_max_length": history_len,
+        "temperature": float(tcfg.get("temperature") or 1.0),
+        "target_smoothing": float(tcfg.get("target_smoothing") or 0.0),
+        "popularity_gamma": float(tcfg.get("popularity_gamma") or 0.0),
+        "label_smoothing": label_smoothing,
+        "learning_rate": float(tcfg.get("learning_rate") or 1e-3),
+        "weight_decay": float(tcfg.get("weight_decay") or 0.0),
+        "batch_size": batch_size,
+        "epochs": epochs,
+    }
+    data_meta = {
+        "n_train": n_train,
+        "n_val": len(val_pairs),
+        "history_max_length": history_len,
+        "split": {"train": "train_examples", "val": "val_examples"},
+    }
     for epoch in range(epochs):
         model.train()
         perm = torch.randperm(n_train, device=device)
@@ -703,6 +726,14 @@ def run_transition(
             best = val_nll
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
             flag = " <- best"
+            save_transition_checkpoint(
+                out,
+                model=model,
+                config=config,
+                sid_fingerprint=sid_table.fingerprint(),
+                data=data_meta,
+                metrics={"best_val_joint_nll": best, "train_steps": step, "epoch": epoch + 1},
+            )
         record = {
             "epoch": epoch + 1,
             "step": step,
@@ -726,29 +757,6 @@ def run_transition(
             break
 
     model.load_state_dict(best_state)
-    config = {
-        "codebook_sizes": codebook_sizes,
-        "levels": levels,
-        "embedding_dim": int(tcfg.get("embedding_dim") or 128),
-        "hidden_dim": int(tcfg.get("hidden_dim") or 256),
-        "decay": float(tcfg.get("decay") or 0.9),
-        "dropout": float(tcfg.get("dropout") or 0.3),
-        "history_max_length": history_len,
-        "temperature": float(tcfg.get("temperature") or 1.0),
-        "target_smoothing": float(tcfg.get("target_smoothing") or 0.0),
-        "popularity_gamma": float(tcfg.get("popularity_gamma") or 0.0),
-        "label_smoothing": label_smoothing,
-        "learning_rate": float(tcfg.get("learning_rate") or 1e-3),
-        "weight_decay": float(tcfg.get("weight_decay") or 0.0),
-        "batch_size": batch_size,
-        "epochs": epochs,
-    }
-    data_meta = {
-        "n_train": n_train,
-        "n_val": len(val_pairs),
-        "history_max_length": history_len,
-        "split": {"train": "train_examples", "val": "val_examples"},
-    }
     metrics = {"best_val_joint_nll": best, "train_steps": step}
     path = save_transition_checkpoint(
         out,

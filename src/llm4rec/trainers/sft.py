@@ -377,8 +377,11 @@ def _run_sft_sharded(
 ) -> dict[str, Any]:
     """MiniOneRec-style data-parallel SFT: shard examples, no DDP wrap."""
     from llm4rec.runtime.checkpointing import (
+        is_better_metric,
         resolve_save_steps,
         resolve_save_total_limit,
+        save_best_checkpoint,
+        save_best_enabled,
         save_step_checkpoint,
         should_save_at_step,
     )
@@ -424,7 +427,11 @@ def _run_sft_sharded(
     logging_steps = max(1, int(sft_cfg.get("logging_steps") or 10))
 
     strategy = runtime.effective_strategy or runtime.strategy.strategy
-    train_core = runtime.maybe_compile(model, name="sft_policy")
+    # inductor 对变长 padding × SID 扩词表（lm_head ~15万维）会在 backward
+    # 里 assert_size_stride 崩掉；这条自定义循环固定走 eager。
+    if dist_utils.is_main():
+        logger.info("[sft] skip torch.compile（变长 batch + SID vocab，inductor 不稳定）")
+    train_core = model
     if strategy == "fsdp" and runtime.world_size > 1:
         train_model = runtime.wrap_model(train_core)
     else:
@@ -474,6 +481,7 @@ def _run_sft_sharded(
     history: list[dict[str, Any]] = []
     last_loss = 0.0
     last_eval = None
+    best_eval: float | None = None
     cursor = 0
     step = 0
     t0 = time.perf_counter()
@@ -556,6 +564,22 @@ def _run_sft_sharded(
                     wandb_prefix="eval",
                 )
                 logger.info(f"[sft] eval step={step} loss={last_eval:.4f}")
+            if (
+                last_eval is not None
+                and save_best_enabled(cfg)
+                and is_better_metric(last_eval, best_eval)
+            ):
+                best_eval = last_eval
+                save_best_checkpoint(
+                    train_model,
+                    output_dir,
+                    metric=last_eval,
+                    step=step,
+                    tokenizer=tokenizer,
+                    logger=logger,
+                    tag=stage,
+                    metric_name="eval_loss",
+                )
 
         if should_save_at_step(step, save_every):
             save_step_checkpoint(
@@ -600,6 +624,8 @@ def _run_sft_sharded(
     }
     if last_eval is not None:
         metrics["eval_loss"] = last_eval
+    if best_eval is not None:
+        metrics["best_eval_loss"] = best_eval
 
     logger.info(f"[sft] 完成，权重 → {final_dir}")
     return {
@@ -859,7 +885,11 @@ def run_sft(
     else:
         warmup_kwargs["warmup_ratio"] = float(sft_cfg.get("warmup_ratio") or 0.0)
 
-    from llm4rec.runtime.checkpointing import resolve_save_steps, resolve_save_total_limit
+    from llm4rec.runtime.checkpointing import (
+        resolve_save_steps,
+        resolve_save_total_limit,
+        save_best_enabled,
+    )
 
     def _step_interval(value: Any) -> int | float | None:
         if value in (None, 0, "null", False):
@@ -959,6 +989,23 @@ def run_sft(
         (Path(output_dir) / "train_log.json").write_text(
             json.dumps(trainer.state.log_history, indent=2) + "\n", encoding="utf-8"
         )
+        best_metric = getattr(trainer.state, "best_metric", None)
+        if save_best_enabled(cfg) and bool(sft_cfg.get("load_best_model_at_end")):
+            best_dir = Path(output_dir) / "best"
+            trainer.save_model(str(best_dir))
+            tokenizer.save_pretrained(str(best_dir))
+            (best_dir / "best_metric.json").write_text(
+                json.dumps(
+                    {
+                        "step": int(getattr(trainer.state, "best_global_step", 0) or 0),
+                        "metric": None if best_metric is None else float(best_metric),
+                        "metric_name": "loss",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
     dist_utils.barrier("sft_saved")
 
     perf = dict(throughput_cb.metrics) if throughput_cb.metrics else {}

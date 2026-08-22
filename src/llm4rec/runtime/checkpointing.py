@@ -1,15 +1,17 @@
-"""Periodic mid-training checkpoint helpers (SFT / RL / DPO).
+"""Periodic mid-training checkpoint helpers (SFT / RL / DPO / distill).
 
 Config (``checkpoint`` in YAML):
 
 * ``save_steps``: int step interval, float in ``(0, 1)`` as a fraction of
   ``max_steps``, or ``null``/``0``/``false`` to disable mid-saves.
 * ``save_total_limit``: keep at most this many ``checkpoint-{step}`` dirs
-  (oldest deleted). Stage ``final/`` is never pruned here.
+  (oldest deleted). Stage ``final/`` and ``best/`` are never pruned here.
+* ``save_best``: when eval improves, overwrite ``best/`` (default true).
 """
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 from pathlib import Path
@@ -51,6 +53,11 @@ def resolve_save_steps(
 
 def resolve_save_total_limit(cfg: dict[str, Any]) -> int:
     return max(1, int((cfg.get("checkpoint") or {}).get("save_total_limit") or 1))
+
+
+def save_best_enabled(cfg: dict[str, Any] | None) -> bool:
+    ckpt = (cfg or {}).get("checkpoint") or {}
+    return bool(ckpt.get("save_best", True))
 
 
 def should_save_at_step(step: int, interval: int | None) -> bool:
@@ -114,3 +121,50 @@ def save_step_checkpoint(
             log(f"[{tag}] mid-checkpoint → {ckpt_dir}{extra}")
     dist_utils.barrier(f"{tag}_ckpt_{step}")
     return ckpt_dir
+
+
+def save_best_checkpoint(
+    model: Any,
+    output_dir: Path | str,
+    *,
+    metric: float,
+    step: int,
+    tokenizer: Any = None,
+    logger: Any = None,
+    tag: str = "train",
+    metric_name: str = "loss",
+    extra: dict[str, Any] | None = None,
+) -> Path:
+    """Overwrite ``output_dir/best`` with the current weights (all ranks sync)."""
+    out = Path(output_dir)
+    best_dir = out / "best"
+    dist_utils.save_pretrained_distributed(
+        model, best_dir, tokenizer=tokenizer, is_main=dist_utils.is_main()
+    )
+    if dist_utils.is_main():
+        payload = {
+            "step": int(step),
+            "metric": float(metric),
+            "metric_name": metric_name,
+        }
+        if extra:
+            payload.update(extra)
+        (best_dir / "best_metric.json").write_text(
+            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+        )
+        log = getattr(logger, "info", None) if logger is not None else None
+        if callable(log):
+            log(f"[{tag}] best checkpoint → {best_dir} ({metric_name}={metric:.4f} @ step {step})")
+    dist_utils.barrier(f"{tag}_best_{step}")
+    return best_dir
+
+
+def is_better_metric(
+    metric: float,
+    best: float | None,
+    *,
+    lower_is_better: bool = True,
+) -> bool:
+    if best is None:
+        return True
+    return float(metric) < float(best) if lower_is_better else float(metric) > float(best)

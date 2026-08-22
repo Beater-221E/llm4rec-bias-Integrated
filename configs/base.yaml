@@ -93,4 +93,5 @@ evaluation:
 checkpoint:
   save_stage_final: true       # 每个 stage 结束存一份（SFT 完 / RL 完）
   save_steps: 500              # 每隔 N 个 optimizer step 存一次；也可用 (0,1) 比例
-  save_total_limit: 3          # 最多保留几个中间 checkpoint（不含 final）
+  save_total_limit: 3          # 最多保留几个中间 checkpoint（不含 final / best）
+  save_best: true              # eval 变好时覆盖 best/

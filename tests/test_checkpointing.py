@@ -5,9 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from llm4rec.runtime.checkpointing import (
+    is_better_metric,
     list_step_checkpoints,
     prune_step_checkpoints,
     resolve_save_steps,
+    save_best_enabled,
     should_save_at_step,
 )
 
@@ -39,3 +41,13 @@ def test_should_save_and_prune(tmp_path: Path):
     left = [p.name for _, p in list_step_checkpoints(tmp_path)]
     assert left == ["checkpoint-300", "checkpoint-400"]
     assert (tmp_path / "final").is_dir()
+
+
+def test_best_metric_and_save_best_flag():
+    assert is_better_metric(0.4, None)
+    assert is_better_metric(0.3, 0.4)
+    assert not is_better_metric(0.5, 0.4)
+    assert is_better_metric(0.9, 0.4, lower_is_better=False)
+    assert save_best_enabled({})
+    assert save_best_enabled({"checkpoint": {"save_best": True}})
+    assert not save_best_enabled({"checkpoint": {"save_best": False}})
