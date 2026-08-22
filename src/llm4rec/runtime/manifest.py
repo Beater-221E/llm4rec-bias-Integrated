@@ -45,7 +45,7 @@ def build_execution_manifest(
 
     # Prefer primary stage batch plan for flat execution fields
     primary_plan: dict[str, Any] = {}
-    for key in ("rl", "sft", "dpo"):
+    for key in ("rl", "sft", "dpo", "distill"):
         if batch_plans and key in batch_plans:
             primary_plan = batch_plans[key] or {}
             break
@@ -141,7 +141,7 @@ def build_execution_manifest(
 
     # Measured performance only (no dummy zeros)
     performance: dict[str, Any] = {}
-    for key in ("sft", "grpo", "dpo", "sid"):
+    for key in ("sft", "grpo", "dpo", "sid", "distill", "transition"):
         block = (cfg.get("_performance") or {}).get(key)
         if isinstance(block, dict) and block:
             performance[key] = block

@@ -30,14 +30,20 @@ _ROUTES = ("minionerec", "recr1", "dpo4rec")
 
 # 每个 route 必须给出的 stage 集合，validate 时校验
 _ROUTE_STAGES: dict[str, set[str]] = {
-    "minionerec": {"sft", "rl", "eval"},
+    "minionerec": {"sft", "rl", "eval", "transition", "distill"},
     # recr1 / dpo4rec 原文都没有 SFT，我们统一加，好让三条路线有同一种基线
     "recr1": {"sft", "rl", "eval"},
     "dpo4rec": {"train_reranker", "sft", "dpo", "eval"},
 }
 
 # 哪个 stage 用 train 配置里的哪个块
-STAGE_TRAIN_KEY: dict[str, str] = {"sft": "sft", "rl": "rl", "dpo": "dpo"}
+STAGE_TRAIN_KEY: dict[str, str] = {
+    "sft": "sft",
+    "rl": "rl",
+    "dpo": "dpo",
+    "transition": "transition",
+    "distill": "distill",
+}
 
 
 def _resolve_layer_path(name: str, root: Path) -> Path:

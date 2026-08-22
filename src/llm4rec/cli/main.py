@@ -7,6 +7,7 @@
     python -m llm4rec.cli.main build-sid     --config minionerec_qwen05b_amazon
     python -m llm4rec.cli.main build-bm25    --config recr1_qwen05b_amazon
     python -m llm4rec.cli.main run           --config minionerec_qwen05b_amazon --stages sft,eval,rl,eval
+    python -m llm4rec.cli.main run           --config minionerec_sda_qwen05b --stages sft,eval,transition,distill,eval
 
 一般不用直接敲这些 —— ``bash prepare.sh`` 和 ``bash run.sh`` 已经包好了。
 任意 ``a.b.c=value`` 可以跟在后面覆盖配置。
@@ -124,7 +125,7 @@ def _print_plan(cfg: dict[str, Any]) -> None:
         f"解码器        : {cfg['decoder']['name']}",
         f"随机种子      : {cfg['seed']}",
     ]
-    for stage in ("sft", "rl", "dpo"):
+    for stage in ("sft", "rl", "dpo", "transition", "distill"):
         block = train.get(stage)
         if not block:
             continue

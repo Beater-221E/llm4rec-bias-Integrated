@@ -87,6 +87,23 @@ def test_overwrite_progress_can_be_disabled():
         assert bar.update(3) == 3
 
 
+def test_live_bar_overwrites_and_skips_info_logs(caplog):
+    import io
+    import logging
+
+    caplog.set_level(logging.INFO, logger="llm4rec.tracking.progress")
+    buf = io.StringIO()
+    with overwrite_progress(5, "distill", enabled=True, file=buf, mininterval=0) as bar:
+        assert bar.bar is not None
+        for _ in range(5):
+            bar.update(1)
+    records = [r for r in caplog.records if "[distill]" in r.getMessage()]
+    assert records == []
+    text = buf.getvalue()
+    assert text
+    assert text.count("\n") <= 2
+
+
 def test_progress_logs_are_time_throttled(caplog):
     import logging
 

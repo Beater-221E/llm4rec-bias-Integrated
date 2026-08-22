@@ -108,7 +108,7 @@ def test_logits_processor_matches_prefix_allowed(tmp_path):
         assert kept == allowed
 
 
-def test_reset_generate_limits_caps_stale_max_length():
+def test_reset_generate_limits_clears_stale_max_length():
     from llm4rec.sid.constraint import reset_generate_limits
 
     class _GC:
@@ -122,7 +122,8 @@ def test_reset_generate_limits_caps_stale_max_length():
 
     reset_generate_limits(_M(), prompt_len=400, max_new_tokens=5, eos_id=2)
     assert _M.generation_config.max_new_tokens == 5
-    assert _M.generation_config.max_length >= 405
+    # Must not keep a conflicting max_length (HF would warn on every generate).
+    assert _M.generation_config.max_length is None
     assert _M.generation_config.eos_token_id == 2
 
 

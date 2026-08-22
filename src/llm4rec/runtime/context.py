@@ -173,7 +173,7 @@ class RuntimeContext:
             )
             new = apply_strategy_fallback(new, self.hardware, mode=self.mode, log=log)
             # Custom GRPO/DPO cannot execute DeepSpeed: prefer FSDP/DDP in auto
-            if stage_l in {"rl", "grpo", "dpo"} and new.strategy.startswith("deepspeed"):
+            if stage_l in {"rl", "grpo", "dpo", "distill"} and new.strategy.startswith("deepspeed"):
                 fallback = "fsdp" if (self.model_params_b or 0) >= 3.0 else "ddp"
                 log(
                     f"[runtime] custom {stage_l} does not execute DeepSpeed; "

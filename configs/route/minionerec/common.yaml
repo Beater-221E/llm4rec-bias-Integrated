@@ -52,3 +52,36 @@ checkpoint:
 evaluation:
   top_k: [1, 5, 10, 20]
   metrics: [hr, ndcg, mrr]
+
+# Optional SDA post-training (used when stages include transition / distill).
+# Default MiniOneRec path remains sft → eval → rl → eval.
+train:
+  transition:
+    history_max_length: 50
+    embedding_dim: 128
+    hidden_dim: 256
+    decay: 0.9
+    dropout: 0.3
+    epochs: 10
+    batch_size: 256
+    learning_rate: 0.001
+    weight_decay: 0.0
+    temperature: 1.0
+    target_smoothing: 0.0
+    popularity_gamma: 0.0
+  distill:
+    hard_weight: 0.5
+    samples_per_prompt: 8
+    exposure_weight: 0.1
+    probability_support: full_vocab
+    epochs: 1
+    learning_rate: 1.0e-5
+    global_batch_size: 128
+    per_device_batch_size: 4
+    gradient_accumulation_steps: 8
+    max_grad_norm: 1.0
+    logging_steps: 10
+    eval_steps: 200
+    bias_eval_steps: 200
+    catalog_chunk_size: 256
+    transition_checkpoint: null

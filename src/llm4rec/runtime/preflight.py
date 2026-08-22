@@ -28,7 +28,7 @@ def run_preflight(
 
     batch_plans: dict[str, BatchPlan] = {}
     train = cfg.get("train") or {}
-    for stage in ("sft", "rl", "dpo"):
+    for stage in ("sft", "rl", "dpo", "distill"):
         block = train.get(stage)
         if not isinstance(block, dict):
             continue

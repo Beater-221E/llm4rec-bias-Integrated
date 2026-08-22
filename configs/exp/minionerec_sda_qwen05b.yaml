@@ -1,0 +1,12 @@
+# MiniOneRec SDA post-training: SFT → eval → Transition teacher → distill → eval
+#
+#     EXP=minionerec_sda_qwen05b bash run.sh
+#     STAGES=sft,eval,transition,distill,eval EXP=minionerec_qwen05b_amazon bash run.sh
+
+defaults:
+  - exp/minionerec_qwen05b_amazon
+
+experiment:
+  name: minionerec_sda_qwen05b
+
+stages: [sft, eval, transition, distill, eval]

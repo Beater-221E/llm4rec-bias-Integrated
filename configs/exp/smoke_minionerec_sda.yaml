@@ -1,0 +1,44 @@
+# MiniOneRec SDA 冒烟：两步 transition + 两步 distill，验证自定义后训练路径。
+#
+#     EXP=smoke_minionerec_sda GPUS=0 bash run.sh
+
+defaults:
+  - exp/minionerec_sda_qwen05b
+
+experiment:
+  name: smoke_minionerec_sda
+
+data:
+  max_train_samples: 64
+  max_eval_samples: 16
+
+train:
+  sft:
+    epochs: 1
+    max_steps: 2
+    eval_steps: 2
+    logging_steps: 1
+    per_device_batch_size: 1
+    gradient_accumulation_steps: 1
+    max_seq_length: 256
+  transition:
+    epochs: 1
+    max_steps: 2
+    batch_size: 16
+    logging_steps: 1
+  distill:
+    epochs: 1
+    max_steps: 2
+    samples_per_prompt: 2
+    per_device_batch_size: 1
+    gradient_accumulation_steps: 1
+    global_batch_size: 1
+    logging_steps: 1
+    eval_steps: 2
+
+bias:
+  final_examples: 16
+
+wandb:
+  group: smoke
+  tags: [smoke, minionerec, sda]

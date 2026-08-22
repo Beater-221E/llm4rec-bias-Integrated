@@ -119,7 +119,7 @@ def resolve_strategy(
     ddp_t, fsdp_t = _auto_thresholds(hw_cfg)
     stage_l = str(stage or "sft").lower()
     # Custom trainers cannot execute DeepSpeed yet — never auto-select it for them.
-    custom_trainer = stage_l in {"rl", "grpo", "dpo", "sid"}
+    custom_trainer = stage_l in {"rl", "grpo", "dpo", "sid", "distill", "transition"}
     allow_deepspeed = stage_l in {"sft", "inference"} and not custom_trainer
 
     # Memory-pressure path (preferred when free VRAM known)

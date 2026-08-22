@@ -242,6 +242,28 @@ class SidTable:
     def items(self) -> Iterable[str]:
         return self.codes.keys()
 
+    def level_codebook_sizes(self) -> tuple[int, ...]:
+        """Per-level codebook width from observed codes (not a uniform K)."""
+        sizes = [1] * self.levels
+        for codes in self.codes.values():
+            for layer, code in enumerate(codes[: self.levels]):
+                sizes[layer] = max(sizes[layer], int(code) + 1)
+        return tuple(sizes)
+
+    def fingerprint(self) -> dict[str, Any]:
+        """Identity of this SID table for Transition checkpoint binding."""
+        return {
+            "config_hash": self.manifest.config_hash,
+            "items_fingerprint": self.manifest.items_fingerprint,
+            "levels": int(self.levels),
+            "codebook_size": int(self.codebook_size),
+            "codebook_sizes": list(self.level_codebook_sizes()),
+            "layer_prefixes": list(self.prefixes),
+            "n_items": len(self.codes),
+            "sid_dir": str(self.dir),
+            "collision_rate": float(self.manifest.collision_rate),
+        }
+
     def __len__(self) -> int:
         return len(self.codes)
 

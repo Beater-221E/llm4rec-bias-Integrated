@@ -1,4 +1,4 @@
-"""Stage 编排 —— SFT → eval → RL/DPO → eval 全自动串联。
+"""Stage 编排 —— SFT → eval → RL/DPO/transition/distill → eval 全自动串联。
 
 三条路线共用同一个编排骨架，路线差异只体现在三个 hook：
 
@@ -47,6 +47,7 @@ class StageContext:
     summaries: dict[str, Any] = field(default_factory=dict)
     eval_history: list[dict[str, Any]] = field(default_factory=list)
     runtime: Any = None
+    artifacts: dict[str, Any] = field(default_factory=dict)
 
 
 class OnlineEvalHook:
@@ -216,6 +217,10 @@ class Pipeline:
                 ctx.summaries["dpo"] = self.run_dpo(ctx)
             elif stage == "train_reranker":
                 ctx.summaries["train_reranker"] = self.run_train_reranker(ctx)
+            elif stage == "transition":
+                ctx.summaries["transition"] = self.run_transition(ctx)
+            elif stage == "distill":
+                ctx.summaries["distill"] = self.run_distill(ctx)
             elif stage == "eval":
                 eval_count += 1
                 tag = f"eval_{eval_count}"
@@ -399,6 +404,12 @@ class Pipeline:
 
     def run_train_reranker(self, ctx: StageContext) -> dict[str, Any]:
         raise ConfigurationError(f"路线 '{self.route}' 不支持 train_reranker stage")
+
+    def run_transition(self, ctx: StageContext) -> dict[str, Any]:
+        raise ConfigurationError(f"路线 '{self.route}' 不支持 transition stage")
+
+    def run_distill(self, ctx: StageContext) -> dict[str, Any]:
+        raise ConfigurationError(f"路线 '{self.route}' 不支持 distill stage")
 
     # ----------------------------------------------------------------- eval
     def run_eval(self, ctx: StageContext, *, tag: str) -> dict[str, Any]:
@@ -643,6 +654,52 @@ class MiniOneRecPipeline(Pipeline):
         reward_cfg.setdefault("implementation", "minionerec_reference")
         rl_cfg["reward"] = reward_cfg
         return make_minionerec_reward(ctx.sid_table, rl_cfg)
+
+    def run_transition(self, ctx: StageContext) -> dict[str, Any]:
+        from llm4rec.sid.transition import run_transition
+
+        summary = run_transition(
+            cfg=self.cfg,
+            sid_table=ctx.sid_table,
+            catalog=ctx.catalog,
+            train_examples=ctx.train_examples,
+            val_examples=ctx.val_examples,
+            output_dir=self.run_dir / "transition",
+            logger=self.logger,
+        )
+        # Teacher artifact only — do not replace the SFT / LLM checkpoint.
+        ctx.artifacts["transition_checkpoint"] = summary["checkpoint"]
+        self.logger.info(
+            f"[transition] teacher → {summary['checkpoint']} "
+            f"(ctx.checkpoint 仍为 {ctx.checkpoint})"
+        )
+        return summary
+
+    def run_distill(self, ctx: StageContext) -> dict[str, Any]:
+        from llm4rec.trainers.sid_distill import run_sid_distill
+
+        model, tokenizer = self.load_model(ctx)
+        hook = self._build_online_hook(ctx, model, tokenizer, stage="distill")
+        summary = run_sid_distill(
+            cfg=self.cfg,
+            model=model,
+            tokenizer=tokenizer,
+            sid_table=ctx.sid_table,
+            catalog=ctx.catalog,
+            train_examples=ctx.train_examples,
+            eval_examples=ctx.val_examples,
+            output_dir=self.run_dir / "distill",
+            logger=self.logger,
+            runtime=self.runtime,
+            artifacts=ctx.artifacts,
+            callbacks=[hook] if hook else [],
+        )
+        if hook:
+            summary["bias_curve"] = hook.history
+        ctx.checkpoint = summary["checkpoint"]
+        del model
+        self._free()
+        return summary
 
 
 # ========================================================== 路线 2：Rec-R1

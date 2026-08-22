@@ -1,8 +1,9 @@
-"""Rank-0 progress: tqdm only on a real TTY; otherwise a sparse INFO line.
+"""Rank-0 progress: one tqdm line that overwrites itself.
 
-``run.sh | tee`` makes stderr a pipe. tqdm ``\\r`` then becomes a new line
-every update and floods the terminal. Under a pipe we never draw a bar —
-rank 0 logs one aggregated line every few seconds instead.
+``run.sh | tee`` makes stdout/stderr pipes, so a bar on stderr would emit a
+new line every refresh. The bar is therefore drawn on ``/dev/tty`` (the
+controlling terminal) and never logged. No TTY at all (nohup) falls back to
+a throttled INFO line.
 
 Multi-GPU eval: ranks publish local counts to files; rank 0 sums them.
 No NCCL on the hot path.
@@ -16,12 +17,30 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, TextIO
 
 from tqdm import tqdm
 
 _LOG = logging.getLogger(__name__)
 _BAR_FORMAT = "{percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+
+
+def _open_overwrite_stream() -> tuple[TextIO | None, bool]:
+    """Prefer the controlling TTY so ``\\r`` overwrites even under ``tee``."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        if sys.stderr.isatty():
+            return sys.stderr, False
+        return None, False
+    if sys.stderr.isatty():
+        return sys.stderr, False
+    try:
+        stream = open("/dev/tty", "w", encoding="utf-8", buffering=1)
+    except OSError:
+        return None, False
+    if stream.isatty():
+        return stream, True
+    stream.close()
+    return None, False
 
 
 def _atomic_write_int(path: Path, value: int) -> None:
@@ -66,7 +85,7 @@ class ProgressHandle:
         self._last_log = 0.0
         if self.paths:
             _atomic_write_int(self.paths[self.rank], 0)
-        if self.rank == 0 and self.global_total > 0:
+        if self.bar is None and self.rank == 0 and self.global_total > 0:
             self._log(0)
 
     def update(self, n: int = 1) -> int:
@@ -77,6 +96,7 @@ class ProgressHandle:
         if self.bar is not None:
             self.bar.n = min(done, self.bar.total or done)
             self.bar.refresh()
+            return done
         if self.rank == 0:
             self._maybe_log(done)
         return done
@@ -112,7 +132,7 @@ class ProgressHandle:
         )
 
     def close(self) -> None:
-        if self.rank == 0 and self.global_total > 0:
+        if self.bar is None and self.rank == 0 and self.global_total > 0:
             done = self.global_done()
             if done and (time.monotonic() - self._last_log) >= 0.2:
                 self._log(done)
@@ -134,16 +154,25 @@ def overwrite_progress(
     progress_dir: str | Path | None = None,
     name: str = "eval",
     log_interval_s: float = 5.0,
+    file: TextIO | None = None,
 ) -> Iterator[ProgressHandle]:
-    """Rank-0 tqdm on a real TTY; otherwise one INFO line every ``log_interval_s``."""
+    """Rank-0 tqdm on the controlling TTY; otherwise a throttled INFO fallback."""
     from llm4rec.core import distributed as dist_utils
 
     local_total = max(0, int(total))
     world = max(1, dist_utils.world_size())
     rank = dist_utils.rank()
     gtotal = int(global_total) if global_total not in (None, 0) else local_total
-    if enabled is None:
-        enabled = dist_utils.is_main() and gtotal > 0 and sys.stderr.isatty()
+    owned_stream = False
+    stream: TextIO | None = file
+    if enabled is False or not dist_utils.is_main() or gtotal <= 0:
+        stream = None
+    elif stream is None:
+        stream, owned_stream = _open_overwrite_stream()
+        if enabled is True and stream is None:
+            stream = sys.stderr
+            owned_stream = False
+    draw_bar = stream is not None
 
     paths: list[Path] | None = None
     if progress_dir is not None and world > 1:
@@ -152,11 +181,11 @@ def overwrite_progress(
         paths = [root / f"{stem}.rank{i}" for i in range(world)]
 
     bar: tqdm | None = None
-    if enabled and gtotal > 0:
+    if draw_bar:
         bar = tqdm(
             total=gtotal,
             desc=desc,
-            file=sys.stderr,
+            file=stream,
             bar_format=_BAR_FORMAT,
             dynamic_ncols=True,
             mininterval=mininterval,
@@ -176,3 +205,5 @@ def overwrite_progress(
         yield handle
     finally:
         handle.close()
+        if owned_stream and stream is not None:
+            stream.close()

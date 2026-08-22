@@ -53,13 +53,23 @@ class SidPrefixLogitsProcessor:
 
 
 def reset_generate_limits(model: Any, prompt_len: int, max_new_tokens: int, eos_id: int) -> None:
-    """Clear stale ``generation_config.max_length`` left by a previous generate."""
+    """Use ``max_new_tokens`` only; drop a stale ``max_length``.
+
+    HuggingFace warns on every ``generate()`` when both are set (this repo's
+    eval loop calls generate once per example). A leftover small ``max_length``
+    from warmup can also clip decode. Clearing it lets HF compute
+    ``max_length = max_new_tokens + prompt_len`` internally.
+    """
+    del prompt_len
     gc = getattr(model, "generation_config", None)
     if gc is None:
         return
     gc.max_new_tokens = int(max_new_tokens)
-    # Keep max_length a loose cap so a stale warmup value cannot clip/expand decode.
-    gc.max_length = max(int(getattr(gc, "max_length", 0) or 0), int(prompt_len) + int(max_new_tokens), 2048)
+    try:
+        gc.max_length = None
+    except (TypeError, ValueError):
+        if hasattr(gc, "__dict__"):
+            gc.__dict__["max_length"] = None
     gc.eos_token_id = int(eos_id)
     gc.pad_token_id = int(eos_id)
 

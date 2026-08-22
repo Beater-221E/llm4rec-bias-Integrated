@@ -266,6 +266,170 @@ def batched_pair_logprobs(
     return lps[0].sum(), lps[1].sum()
 
 
+def sid_sequence_nll(
+    model: Any,
+    prompts: Sequence[torch.Tensor],
+    completions: Sequence[torch.Tensor],
+    *,
+    pad_token_id: int | None = None,
+    pad_to_multiple_of: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Teacher-forced SID completion NLL + first-token logits.
+
+    Mapped from reference ``sid_distill.sequence_nll``, implemented on top of
+    the same padded multi-prompt scorer as GRPO/DPO:
+
+    * NLL only over SID completion tokens
+    * heterogeneous prompt lengths
+    * ``logits_to_keep`` when the model supports it
+    * first-token logits (the position that predicts SID level-1)
+
+    Returns ``(nll[N], first_logits[N, V])``.
+    """
+    if not completions:
+        empty = torch.zeros(0, dtype=torch.float32)
+        return empty, empty.view(0, 0)
+    nll_rows, first_logits = _score_padded_batch_with_first_logits(
+        model,
+        prompts,
+        completions,
+        pad_token_id=pad_token_id,
+        pad_to_multiple_of=pad_to_multiple_of,
+    )
+    nll = torch.stack(
+        [
+            (-lp).sum() if lp.numel() else lp.new_zeros(())
+            for lp in nll_rows
+        ]
+    )
+    return nll, torch.stack(first_logits)
+
+
+def _score_padded_batch_with_first_logits(
+    model: Any,
+    prompts: Sequence[torch.Tensor],
+    completions: Sequence[torch.Tensor],
+    *,
+    pad_token_id: int | None = None,
+    pad_to_multiple_of: int | None = None,
+    max_chunk: int | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Like ``_score_padded_batch`` but also keeps first-completion-token logits."""
+    assert len(prompts) == len(completions)
+    if not completions:
+        return [], []
+    prompt_lens = [int(p.numel()) for p in prompts]
+    comp_lens = [int(c.numel()) for c in completions]
+    max_seq = max(pl + cl for pl, cl in zip(prompt_lens, comp_lens, strict=True))
+    max_seq = _pad_len(max_seq, pad_to_multiple_of)
+    batch = len(completions)
+    chunk = int(max_chunk) if max_chunk is not None else logprob_chunk_size(
+        batch,
+        max_seq,
+        _infer_vocab_size(model),
+        budget_bytes=vram_logprob_budget_bytes(),
+    )
+    if batch > chunk:
+        nll_out: list[torch.Tensor] = []
+        logit_out: list[torch.Tensor] = []
+        for start in range(0, batch, chunk):
+            end = min(batch, start + chunk)
+            nll_part, logit_part = _score_padded_batch_with_first_logits(
+                model,
+                prompts[start:end],
+                completions[start:end],
+                pad_token_id=pad_token_id,
+                pad_to_multiple_of=pad_to_multiple_of,
+                max_chunk=chunk,
+            )
+            nll_out.extend(nll_part)
+            logit_out.extend(logit_part)
+        return nll_out, logit_out
+
+    try:
+        return _forward_padded_batch_with_first_logits(
+            model,
+            prompts,
+            completions,
+            prompt_lens=prompt_lens,
+            comp_lens=comp_lens,
+            max_seq=max_seq,
+            pad_token_id=pad_token_id,
+        )
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+        if not _is_cuda_oom(exc) or batch <= 1:
+            raise
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        mid = max(1, batch // 2)
+        left = _score_padded_batch_with_first_logits(
+            model,
+            prompts[:mid],
+            completions[:mid],
+            pad_token_id=pad_token_id,
+            pad_to_multiple_of=pad_to_multiple_of,
+            max_chunk=mid,
+        )
+        right = _score_padded_batch_with_first_logits(
+            model,
+            prompts[mid:],
+            completions[mid:],
+            pad_token_id=pad_token_id,
+            pad_to_multiple_of=pad_to_multiple_of,
+            max_chunk=mid,
+        )
+        return left[0] + right[0], left[1] + right[1]
+
+
+def _forward_padded_batch_with_first_logits(
+    model: Any,
+    prompts: Sequence[torch.Tensor],
+    completions: Sequence[torch.Tensor],
+    *,
+    prompt_lens: list[int],
+    comp_lens: list[int],
+    max_seq: int,
+    pad_token_id: int | None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    batch = len(completions)
+    device = prompts[0].device
+    pad_id = 0 if pad_token_id is None else int(pad_token_id)
+    input_ids = torch.full((batch, max_seq), pad_id, dtype=prompts[0].dtype, device=device)
+    attention_mask = torch.zeros((batch, max_seq), dtype=torch.long, device=device)
+    for i, (prompt, comp) in enumerate(zip(prompts, completions, strict=True)):
+        pl, cl = prompt_lens[i], comp_lens[i]
+        input_ids[i, :pl] = prompt
+        attention_mask[i, :pl] = 1
+        if cl > 0:
+            input_ids[i, pl : pl + cl] = comp
+            attention_mask[i, pl : pl + cl] = 1
+
+    keep = max(1, max_seq - min(prompt_lens) + 1)
+    try:
+        logits = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            logits_to_keep=keep,
+        ).logits
+    except TypeError:
+        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+    offset = max_seq - int(logits.shape[1]) if int(logits.shape[1]) < max_seq else 0
+    token_lps: list[torch.Tensor] = []
+    first_logits: list[torch.Tensor] = []
+    vocab = int(logits.shape[-1])
+    for i, (pl, cl) in enumerate(zip(prompt_lens, comp_lens, strict=True)):
+        start = pl - 1 - offset
+        if cl == 0:
+            token_lps.append(completions[i].new_empty((0,), dtype=torch.float32))
+            first_logits.append(logits.new_zeros((vocab,)))
+            continue
+        token_logits = logits[i, start : start + cl, :].float()
+        log_probs = F.log_softmax(token_logits, dim=-1)
+        token_lps.append(log_probs.gather(-1, completions[i].unsqueeze(-1)).squeeze(-1))
+        first_logits.append(token_logits[0])
+    return token_lps, first_logits
+
+
 def score_preference_batch(
     model: Any,
     prompts: Sequence[torch.Tensor],
