@@ -5,7 +5,12 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from llm4rec.trainers.logprobs import batched_sequence_logprobs, sequence_logprobs
+from llm4rec.trainers.logprobs import (
+    batched_multi_prompt_logprobs,
+    batched_sequence_logprobs,
+    sequence_logprobs,
+    sid_sequence_nll,
+)
 from llm4rec.trainers.grpo import compute_grpo_loss, group_advantages
 from llm4rec.trainers.dpo import dpo_loss
 from llm4rec.trainers.logprobs import batched_pair_logprobs
@@ -23,6 +28,31 @@ class TinyLM(nn.Module):
         h = self.embed(input_ids)
         logits = self.out(h)
         return type("O", (), {"logits": logits})()
+
+
+class TinyLMKeep(TinyLM):
+    def forward(self, input_ids=None, attention_mask=None, logits_to_keep=None, **kwargs):
+        out = super().forward(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+        if logits_to_keep is not None:
+            keep = int(logits_to_keep)
+            out.logits = out.logits[:, -keep:, :]
+        return out
+
+
+def test_left_padded_logprobs_match_with_logits_to_keep():
+    torch.manual_seed(0)
+    model = TinyLMKeep()
+    model.eval()
+    prompts = [torch.randint(0, 32, (n,)) for n in (4, 9, 3)]
+    comps = [torch.randint(0, 32, (n,)) for n in (2, 5, 3)]
+    with torch.no_grad():
+        seq = [sequence_logprobs(model, p, c) for p, c in zip(prompts, comps)]
+        bat = batched_multi_prompt_logprobs(model, prompts, comps, pad_token_id=0)
+        nll, first = sid_sequence_nll(model, prompts, comps, pad_token_id=0)
+    for a, b in zip(seq, bat):
+        assert torch.allclose(a, b, atol=1e-5, rtol=1e-5)
+    assert first.shape == (len(prompts), 32)
+    assert torch.allclose(nll, torch.stack([-s.sum() for s in seq]), atol=1e-5)
 
 
 def test_batched_sequence_logprobs_matches_sequential():
